@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# github-notifications - redacted, read-only GitHub notification monitor.
+#
+# Usage:
+#   github-notifications [options] check
+#   github-notifications [options] pending
+#   github-notifications [options] show
+#   github-notifications [options] ack
+#   github-notifications --help
+#
+# Options:
+#   --state-dir DIR   Store state in DIR (default: $OSS_MATE_STATE_DIR or
+#                     $XDG_STATE_HOME/oss-mate, falling back to ~/.local/state/oss-mate).
+#   --config FILE     Read owned-elsewhere JSON (default: $OSS_MATE_OWNED_CONFIG,
+#                     or DIR/github-notifications-owned.json when unset).
+#   --budget SECONDS  Bound a check run (default: $OSS_MATE_CHECK_BUDGET or 20; 1..25).
+#
+# Checks poll at most once daily by default, controlled by OSS_MATE_MIN_POLL_SECONDS (default 86400).
+# Daily is enough because the goal is never losing track of a relevant thread, not real-time response.
+# GitHub's X-Poll-Interval is honored as an additional minimum.
+# The first run looks back 24 hours, and later polls overlap their cursor by six hours.
+#
+# Files:
+#   DIR/github-notifications.json       Atomic mode-0600 cursor, dedup, and redacted pending data.
+#   DIR/.github-notifications.lock      Directory used to serialize checks.
+#   FILE                                Optional {"owners":["owner"],"repositories":["owner/repo"]}.
+#
+# Output:
+#   check prints exactly one line only for newly persisted threads:
+#     github notifications: external=N; excluded=N; run github-notifications pending
+#   pending and show print one redacted line per external thread followed, when nonzero, by:
+#     excluded count=N
+#   ack atomically clears pending details after successful triage while retaining the cursor and dedup set.
+#   External lines contain id, reason, type, repository, and a JSON-quoted bounded title.
+#   Excluded records and lines never contain a repository name or title.
+#
+# The API requests are GET-only and never mark a thread read.
+# Participating reasons cover comments on and merges of the user's pull requests in other repositories.
+# Subscribed or manual Issue and PullRequest threads are included only when the authenticated user owns the repository, covering newly opened pull requests and issues there without watched-repository noise.
+# Threads whose reason is ci_activity advance the cursor and dedup set but are never surfaced or pending.
+# Notification content is untrusted data and is only projected into bounded display fields.
+set -eu
+export LC_ALL=C
+
+fail() { printf 'github-notifications: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -eu$/s/^# \{0,1\}//p' "$0"; }
+
+STATE_DIR=${OSS_MATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oss-mate}
+CONFIG=${OSS_MATE_OWNED_CONFIG:-}
+BUDGET=${OSS_MATE_CHECK_BUDGET:-20}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --state-dir) [ "$#" -ge 2 ] || fail '--state-dir needs a value'; STATE_DIR=$2; shift 2 ;;
+    --config) [ "$#" -ge 2 ] || fail '--config needs a value'; CONFIG=$2; shift 2 ;;
+    --budget) [ "$#" -ge 2 ] || fail '--budget needs a value'; BUDGET=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    check|pending|show|ack) ACTION=$1; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments'; break ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+ACTION=${ACTION:-check}
+case "$BUDGET" in ''|*[!0-9]*) fail '--budget must be a whole number from 1 to 25' ;; esac
+[ "$BUDGET" -ge 1 ] && [ "$BUDGET" -le 25 ] || fail '--budget must be a whole number from 1 to 25'
+[ -n "$CONFIG" ] || CONFIG="$STATE_DIR/github-notifications-owned.json"
+RECORD="$STATE_DIR/github-notifications.json"
+LOCK="$STATE_DIR/.github-notifications.lock"
+SCHEMA=oss-mate-github-notifications-v1
+LOOKBACK=${OSS_MATE_FIRST_RUN_LOOKBACK_SECONDS:-86400}
+OVERLAP=${OSS_MATE_CURSOR_OVERLAP_SECONDS:-21600}
+MIN_POLL=${OSS_MATE_MIN_POLL_SECONDS:-86400}
+NOW=${OSS_MATE_NOW:-$(date +%s)}
+case "$NOW:$LOOKBACK:$OVERLAP:$MIN_POLL" in *[!0-9:]*) fail 'time settings must be whole seconds' ;; esac
+command -v jq >/dev/null 2>&1 || fail 'jq is required'
+command -v gh >/dev/null 2>&1 || fail 'gh is required'
+
+empty_state() {
+  jq -n --arg schema "$SCHEMA" '{schema:$schema,since:null,last_modified:null,next_poll:0,login:null,seen:[],external:[],excluded_count:0}'
+}
+validate_state() {
+  jq -e --arg schema "$SCHEMA" '
+    .schema == $schema and (.since == null or (.since|type)=="string") and
+    (.last_modified == null or (.last_modified|type)=="string") and
+    (.login == null or (.login|type)=="string") and
+    (.next_poll|type)=="number" and (.seen|type)=="array" and
+    all(.seen[]; type=="string") and (.external|type)=="array" and
+    all(.external[]; (.id|type)=="string" and (.reason|type)=="string" and
+      (.type|type)=="string" and (.repository|type)=="string" and (.title|type)=="string") and
+    (.excluded_count|type)=="number"
+  ' "$1" >/dev/null 2>&1
+}
+validate_config() {
+  [ -e "$CONFIG" ] || return 0
+  [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail 'owned-elsewhere config must be a regular file'
+  jq -e 'type=="object" and ((.owners // [])|type)=="array" and
+    ((.repositories // [])|type)=="array" and
+    all((.owners // [])[]; type=="string" and length>0) and
+    all((.repositories // [])[]; type=="string" and test("^[^/]+/[^/]+$"))' "$CONFIG" >/dev/null 2>&1 \
+    || fail 'owned-elsewhere config is invalid'
+}
+show_pending() {
+  [ -f "$RECORD" ] || exit 0
+  validate_state "$RECORD" || fail 'state file is invalid'
+  jq -r '. as $state |
+    ($state.external[] | "external id=\(.id) reason=\(.reason) type=\(.type) repository=\(.repository) title=\(.title|@json)"),
+    ($state | select(.excluded_count > 0) | "excluded count=\(.excluded_count)")' "$RECORD"
+}
+if [ "$ACTION" = pending ] || [ "$ACTION" = show ]; then show_pending; exit 0; fi
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then exit 0; fi
+TMPDIR_RUN=$(mktemp -d "$STATE_DIR/.github-notifications.XXXXXX")
+cleanup() { rm -rf -- "$TMPDIR_RUN" "$LOCK"; }
+trap cleanup EXIT HUP INT TERM
+if [ "$ACTION" = ack ]; then
+  [ -f "$RECORD" ] || exit 0
+  validate_state "$RECORD" || fail 'state file is invalid'
+  jq '.external=[] | .excluded_count=0' "$RECORD" > "$TMPDIR_RUN/ack.json"
+  chmod 600 "$TMPDIR_RUN/ack.json"
+  mv -f -- "$TMPDIR_RUN/ack.json" "$RECORD"
+  exit 0
+fi
+validate_config
+if [ -f "$RECORD" ]; then
+  validate_state "$RECORD" || fail 'state file is invalid'
+  cp "$RECORD" "$TMPDIR_RUN/old.json"
+else
+  empty_state > "$TMPDIR_RUN/old.json"
+fi
+NEXT=$(jq -r .next_poll "$TMPDIR_RUN/old.json")
+[ "$NOW" -ge "$NEXT" ] || exit 0
+
+SINCE=$(jq -r '.since // empty' "$TMPDIR_RUN/old.json")
+if [ -n "$SINCE" ]; then
+  SINCE_EPOCH=$(date -u -d "$SINCE" +%s 2>/dev/null) || fail 'stored cursor is invalid'
+  QUERY_EPOCH=$((SINCE_EPOCH > OVERLAP ? SINCE_EPOCH - OVERLAP : 0))
+else
+  QUERY_EPOCH=$((NOW > LOOKBACK ? NOW - LOOKBACK : 0))
+fi
+QUERY_SINCE=$(date -u -d "@$QUERY_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+REQUEST_CURSOR=$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)
+DEADLINE=$(( $(date +%s) + BUDGET ))
+REMAIN=$((DEADLINE - $(date +%s)))
+[ "$REMAIN" -gt 0 ] || fail 'check budget exhausted before authenticated-user lookup'
+timeout "$REMAIN" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET user > "$TMPDIR_RUN/user.json" \
+  || fail 'authenticated-user lookup failed or exceeded its budget'
+LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+  || fail 'authenticated-user lookup returned an invalid login'
+URL="/notifications?all=true&per_page=100&since=$QUERY_SINCE"
+: > "$TMPDIR_RUN/all.jsonl"
+POLL=60
+LAST_MODIFIED=
+PAGE=0
+while [ -n "$URL" ]; do
+  PAGE=$((PAGE + 1))
+  [ "$PAGE" -le 20 ] || fail 'notification pagination exceeded 20 pages'
+  REMAIN=$((DEADLINE - $(date +%s)))
+  [ "$REMAIN" -gt 0 ] || fail 'check budget exhausted before pagination completed'
+  RESPONSE="$TMPDIR_RUN/response.$PAGE"
+  timeout "$REMAIN" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api -i --method GET "$URL" > "$RESPONSE" \
+    || fail 'GitHub notification read failed or exceeded its budget'
+  BODY="$TMPDIR_RUN/body.$PAGE.json"
+  awk 'found {print} /^\r?$/ {found=1}' "$RESPONSE" > "$BODY"
+  jq -e 'type=="array"' "$BODY" >/dev/null 2>&1 || fail 'GitHub returned an invalid notification page'
+  jq -c '.[]' "$BODY" >> "$TMPDIR_RUN/all.jsonl"
+  [ -n "$LAST_MODIFIED" ] || LAST_MODIFIED=$(awk 'BEGIN{IGNORECASE=1} /^Last-Modified:/ {sub(/\r$/,""); sub(/^[^:]*:[ ]*/,""); print; exit}' "$RESPONSE")
+  HEADER_POLL=$(awk 'BEGIN{IGNORECASE=1} /^X-Poll-Interval:/ {sub(/\r$/,""); sub(/^[^:]*:[ ]*/,""); print; exit}' "$RESPONSE")
+  case "$HEADER_POLL" in ''|*[!0-9]*) ;; *) [ "$HEADER_POLL" -gt "$POLL" ] && POLL=$HEADER_POLL ;; esac
+  URL=$(awk 'BEGIN{IGNORECASE=1} /^Link:/ && /rel="next"/ {
+    line=$0; n=split(line,a,","); for(i=1;i<=n;i++) if(a[i]~/rel="next"/) {sub(/^.*</,"",a[i]); sub(/>.*/,"",a[i]); sub(/^https:\/\/api.github.com/,"",a[i]); print a[i]}}
+  ' "$RESPONSE")
+done
+jq -s '.' "$TMPDIR_RUN/all.jsonl" > "$TMPDIR_RUN/all.json"
+if [ -e "$CONFIG" ]; then cp "$CONFIG" "$TMPDIR_RUN/config.json"; else printf '{"owners":[],"repositories":[]}\n' > "$TMPDIR_RUN/config.json"; fi
+
+NEXT_INTERVAL=$POLL
+[ "$MIN_POLL" -le "$NEXT_INTERVAL" ] || NEXT_INTERVAL=$MIN_POLL
+jq -n --arg schema "$SCHEMA" --arg cursor "$REQUEST_CURSOR" --arg modified "$LAST_MODIFIED" --arg login "$LOGIN" \
+  --argjson next "$((NOW + NEXT_INTERVAL))" --slurpfile old "$TMPDIR_RUN/old.json" \
+  --slurpfile rows "$TMPDIR_RUN/all.json" --slurpfile config "$TMPDIR_RUN/config.json" '
+  def sane: tostring | gsub("[\u0000-\u001f\u007f]"; " ");
+  def owned($repo;$config):
+    any(($config.owners // [])[]; ascii_downcase == ($repo.owner.login | ascii_downcase)) or
+    any(($config.repositories // [])[]; ascii_downcase == ($repo.full_name | ascii_downcase));
+  def relevant($notification;$login):
+    ($notification.reason | IN("assign","author","comment","invitation","mention","review_requested","security_alert","state_change","team_mention")) or
+    (($notification.reason | IN("subscribed","manual")) and
+      ($notification.repository.owner.login | ascii_downcase) == ($login | ascii_downcase) and
+      ($notification.subject.type | IN("PullRequest","Issue")));
+  $old[0] as $o | $rows[0] as $all | $config[0] as $config |
+  [$all[] | select((.id|type)=="string" and (.updated_at|type)=="string") |
+    . + {_key:(.id + "@" + .updated_at)} | . as $notification |
+    select(($o.seen | index($notification._key)) == null)] as $fresh |
+  [$fresh[] | select(.reason != "ci_activity") | select(relevant(.;$login)) |
+    select(.repository.private == false and (owned(.repository;$config)|not)) |
+    {id:(.id|sane),reason:(.reason|sane),type:(.subject.type|sane),
+     repository:(.repository.full_name|sane),title:(.subject.title|sane|.[0:160])}] as $external |
+  [$fresh[] | select(.reason != "ci_activity") | select(relevant(.;$login)) |
+    select((.repository.private != false) or owned(.repository;$config))] as $excluded |
+  {schema:$schema,since:$cursor,last_modified:(if $modified=="" then $o.last_modified else $modified end),next_poll:$next,login:$login,
+   seen:(($o.seen + [$fresh[]._key]) | unique),
+   external:(($o.external + $external) | unique_by(.id,.reason,.type,.repository,.title)),
+   excluded_count:($o.excluded_count + ($excluded|length)),
+   _new_external:($external|length),_new_excluded:($excluded|length)}
+  ' > "$TMPDIR_RUN/new-with-counts.json"
+NEW_EXTERNAL=$(jq -r ._new_external "$TMPDIR_RUN/new-with-counts.json")
+NEW_EXCLUDED=$(jq -r ._new_excluded "$TMPDIR_RUN/new-with-counts.json")
+jq 'del(._new_external,._new_excluded)' "$TMPDIR_RUN/new-with-counts.json" > "$TMPDIR_RUN/publish.json"
+chmod 600 "$TMPDIR_RUN/publish.json"
+mv -f -- "$TMPDIR_RUN/publish.json" "$RECORD"
+if [ "$NEW_EXTERNAL" -gt 0 ] || [ "$NEW_EXCLUDED" -gt 0 ]; then
+  printf 'github notifications: external=%s; excluded=%s; run github-notifications pending\n' "$NEW_EXTERNAL" "$NEW_EXCLUDED"
+fi
