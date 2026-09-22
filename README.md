@@ -48,7 +48,13 @@ The script also enforces a daily minimum between API polls by default, so a more
 `OSS_MATE_MIN_POLL_SECONDS` overrides that minimum when a different cadence is deliberately required, while GitHub's `X-Poll-Interval` remains an additional floor.
 The default budget is 20 seconds and can be changed with `--budget` when the calling system has a different execution limit.
 Run `bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" pending` to inspect the redacted durable details after a nonempty check result.
-After the details have been classified and reported to the operator, run the same command with `ack` to clear pending details while preserving the cursor and dedup set.
+After the details have been classified and reported to the operator, run the same command with `ack` to clear the local pending projection while preserving the cursor and dedup set.
+`ack` does not mark anything read on GitHub.
+To mark the pending threads read on GitHub, run the same command with `mark-read --yes`.
+Without `--yes`, `mark-read` prints how many pending threads would be marked read and makes no GitHub mutation.
+`mark-read` processes pending threads one at a time, clears each local row only after its remote mark-read succeeds, and stops with a one-line summary if a remote call fails so a later run can resume the remainder.
+Optional thread ids after `mark-read` narrow the set but never widen it beyond the current pending projection.
+`check`, `pending`, `show`, and `ack` never mark a thread read on GitHub.
 The non-user-invocable skill at `skills/github-notification-triage/SKILL.md` owns the generic read-only classification and summary procedure.
 
 ## Development

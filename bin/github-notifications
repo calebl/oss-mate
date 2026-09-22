@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# github-notifications - redacted, read-only GitHub notification monitor.
+# github-notifications - redacted GitHub notification monitor.
 #
 # Usage:
 #   github-notifications [options] check
 #   github-notifications [options] pending
 #   github-notifications [options] show
 #   github-notifications [options] ack
+#   github-notifications [options] mark-read [--yes] [thread-id ...]
 #   github-notifications --help
 #
 # Options:
@@ -22,7 +23,7 @@
 #
 # Files:
 #   DIR/github-notifications.json       Atomic mode-0600 cursor, dedup, and redacted pending data.
-#   DIR/.github-notifications.lock      Directory used to serialize checks.
+#   DIR/.github-notifications.lock      Directory used to serialize checks and mark-read.
 #   FILE                                Optional {"owners":["owner"],"repositories":["owner/repo"]}.
 #
 # Output:
@@ -30,11 +31,15 @@
 #     github notifications: external=N; excluded=N; run github-notifications pending
 #   pending and show print one redacted line per external thread followed, when nonzero, by:
 #     excluded count=N
-#   ack atomically clears pending details after successful triage while retaining the cursor and dedup set.
+#   ack atomically clears the local pending projection without touching GitHub.
+#   mark-read without --yes prints how many pending threads would be marked read on GitHub.
+#   mark-read with --yes PATCHes each pending thread read on GitHub one at a time, clearing
+#   local pending rows only after each remote success; a failure stops with a one-line summary.
+#   check, pending, show, and ack never mark a thread read on GitHub.
 #   External lines contain id, reason, type, repository, and a JSON-quoted bounded title.
 #   Excluded records and lines never contain a repository name or title.
 #
-# The API requests are GET-only and never mark a thread read.
+# The check API requests are GET-only and never mark a thread read.
 # Participating reasons cover comments on and merges of the user's pull requests in other repositories.
 # Subscribed or manual Issue and PullRequest threads are included only when the authenticated user owns the repository, covering newly opened pull requests and issues there without watched-repository noise.
 # Threads whose reason is ci_activity advance the cursor and dedup set but are never surfaced or pending.
@@ -48,6 +53,8 @@ usage() { sed -n '2,/^set -eu$/s/^# \{0,1\}//p' "$0"; }
 STATE_DIR=${OSS_MATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oss-mate}
 CONFIG=${OSS_MATE_OWNED_CONFIG:-}
 BUDGET=${OSS_MATE_CHECK_BUDGET:-20}
+YES=0
+THREAD_IDS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --state-dir) [ "$#" -ge 2 ] || fail '--state-dir needs a value'; STATE_DIR=$2; shift 2 ;;
@@ -55,6 +62,16 @@ while [ "$#" -gt 0 ]; do
     --budget) [ "$#" -ge 2 ] || fail '--budget needs a value'; BUDGET=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     check|pending|show|ack) ACTION=$1; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments'; break ;;
+    mark-read)
+      ACTION=$1; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --yes) YES=1; shift ;;
+          *) THREAD_IDS+=("$1"); shift ;;
+        esac
+      done
+      break
+      ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
@@ -74,7 +91,12 @@ command -v jq >/dev/null 2>&1 || fail 'jq is required'
 command -v gh >/dev/null 2>&1 || fail 'gh is required'
 
 empty_state() {
-  jq -n --arg schema "$SCHEMA" '{schema:$schema,since:null,last_modified:null,next_poll:0,login:null,seen:[],external:[],excluded_count:0}'
+  jq -n --arg schema "$SCHEMA" '{schema:$schema,since:null,last_modified:null,next_poll:0,login:null,seen:[],external:[],excluded:[]}'
+}
+normalize_state() {
+  jq '
+    if has("excluded_count") and (has("excluded") | not) then . + {excluded:[]} | del(.excluded_count) else . end
+  '
 }
 validate_state() {
   jq -e --arg schema "$SCHEMA" '
@@ -85,7 +107,7 @@ validate_state() {
     all(.seen[]; type=="string") and (.external|type)=="array" and
     all(.external[]; (.id|type)=="string" and (.reason|type)=="string" and
       (.type|type)=="string" and (.repository|type)=="string" and (.title|type)=="string") and
-    (.excluded_count|type)=="number"
+    (.excluded|type)=="array" and all(.excluded[]; (.id|type)=="string")
   ' "$1" >/dev/null 2>&1
 }
 validate_config() {
@@ -102,28 +124,92 @@ show_pending() {
   validate_state "$RECORD" || fail 'state file is invalid'
   jq -r '. as $state |
     ($state.external[] | "external id=\(.id) reason=\(.reason) type=\(.type) repository=\(.repository) title=\(.title|@json)"),
-    ($state | select(.excluded_count > 0) | "excluded count=\(.excluded_count)")' "$RECORD"
+    ($state | select((.excluded|length) > 0) | "excluded count=\(.excluded|length)")' "$RECORD"
+}
+pending_thread_ids() {
+  jq -r '.external[].id, .excluded[].id' "$1"
+}
+select_mark_read_ids() {
+  local state_file=$1
+  shift
+  local -a filter=("$@")
+  if [ "${#filter[@]}" -eq 0 ]; then
+    pending_thread_ids "$state_file"
+    return
+  fi
+  local id
+  for id in "${filter[@]}"; do
+    jq -e --arg id "$id" 'any(.external[]?,.excluded[]?; .id == $id)' "$state_file" >/dev/null 2>&1 \
+      || fail "thread id not pending: $id"
+    printf '%s\n' "$id"
+  done
+}
+mark_read_dry_run() {
+  [ -f "$RECORD" ] || { printf 'mark-read: would mark 0 threads read on GitHub\n'; exit 0; }
+  validate_state "$RECORD" || fail 'state file is invalid'
+  local count
+  if [ "${#THREAD_IDS[@]}" -eq 0 ]; then
+    count=$(jq '(.external|length) + (.excluded|length)' "$RECORD")
+  else
+    count=${#THREAD_IDS[@]}
+  fi
+  printf 'mark-read: would mark %s threads read on GitHub\n' "$count"
+}
+mark_read_execute() {
+  [ -f "$RECORD" ] || exit 0
+  validate_state "$RECORD" || fail 'state file is invalid'
+  local -a ids=()
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    ids+=("$id")
+  done < <(select_mark_read_ids "$RECORD" "${THREAD_IDS[@]}")
+  local marked=0
+  local tmp
+  for id in "${ids[@]}"; do
+    if ! env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "notifications/threads/$id" -f read=true >/dev/null; then
+      printf 'mark-read: marked=%s failed=1 remaining=%s\n' "$marked" "$((${#ids[@]} - marked))"
+      exit 1
+    fi
+    tmp=$(mktemp "$TMPDIR_RUN/mark-read.XXXXXX")
+    jq --arg id "$id" '
+      .external = [.external[] | select(.id != $id)] |
+      .excluded = [.excluded[] | select(.id != $id)]
+    ' "$RECORD" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$RECORD"
+    marked=$((marked + 1))
+  done
+  printf 'mark-read: marked=%s failed=0 remaining=0\n' "$marked"
 }
 if [ "$ACTION" = pending ] || [ "$ACTION" = show ]; then show_pending; exit 0; fi
+if [ "$ACTION" = mark-read ] && [ "$YES" -eq 0 ]; then mark_read_dry_run; exit 0; fi
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
-if ! mkdir "$LOCK" 2>/dev/null; then exit 0; fi
+if ! mkdir "$LOCK" 2>/dev/null; then
+  [ "$ACTION" = check ] && exit 0
+  fail 'another github-notifications command holds the lock'
+fi
 TMPDIR_RUN=$(mktemp -d "$STATE_DIR/.github-notifications.XXXXXX")
 cleanup() { rm -rf -- "$TMPDIR_RUN" "$LOCK"; }
 trap cleanup EXIT HUP INT TERM
 if [ "$ACTION" = ack ]; then
   [ -f "$RECORD" ] || exit 0
   validate_state "$RECORD" || fail 'state file is invalid'
-  jq '.external=[] | .excluded_count=0' "$RECORD" > "$TMPDIR_RUN/ack.json"
+  jq '.external=[] | .excluded=[]' "$RECORD" > "$TMPDIR_RUN/ack.json"
   chmod 600 "$TMPDIR_RUN/ack.json"
   mv -f -- "$TMPDIR_RUN/ack.json" "$RECORD"
+  exit 0
+fi
+if [ "$ACTION" = mark-read ]; then
+  mark_read_execute
   exit 0
 fi
 validate_config
 if [ -f "$RECORD" ]; then
   validate_state "$RECORD" || fail 'state file is invalid'
-  cp "$RECORD" "$TMPDIR_RUN/old.json"
+  normalize_state < "$RECORD" > "$TMPDIR_RUN/old.json"
 else
   empty_state > "$TMPDIR_RUN/old.json"
 fi
@@ -196,11 +282,12 @@ jq -n --arg schema "$SCHEMA" --arg cursor "$REQUEST_CURSOR" --arg modified "$LAS
     {id:(.id|sane),reason:(.reason|sane),type:(.subject.type|sane),
      repository:(.repository.full_name|sane),title:(.subject.title|sane|.[0:160])}] as $external |
   [$fresh[] | select(.reason != "ci_activity") | select(relevant(.;$login)) |
-    select((.repository.private != false) or owned(.repository;$config))] as $excluded |
+    select((.repository.private != false) or owned(.repository;$config)) |
+    {id:(.id|sane)}] as $excluded |
   {schema:$schema,since:$cursor,last_modified:(if $modified=="" then $o.last_modified else $modified end),next_poll:$next,login:$login,
    seen:(($o.seen + [$fresh[]._key]) | unique),
    external:(($o.external + $external) | unique_by(.id,.reason,.type,.repository,.title)),
-   excluded_count:($o.excluded_count + ($excluded|length)),
+   excluded:(($o.excluded + $excluded) | unique_by(.id)),
    _new_external:($external|length),_new_excluded:($excluded|length)}
   ' > "$TMPDIR_RUN/new-with-counts.json"
 NEW_EXTERNAL=$(jq -r ._new_external "$TMPDIR_RUN/new-with-counts.json")

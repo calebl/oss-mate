@@ -11,6 +11,15 @@ cat > "$TMP/fakebin/gh" <<'FAKE'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$FAKE_LOG"
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$3" = PATCH ]; then
+  thread=${4#notifications/threads/}
+  if [ -n "${FAKE_PATCH_FAIL:-}" ] && [ -f "$FAKE_PATCH_FAIL" ] && grep -qx "$thread" "$FAKE_PATCH_FAIL"; then
+    printf 'HTTP/2.0 500 Internal Server Error\r\n\r\n{"message":"fail"}'
+    exit 1
+  fi
+  printf 'HTTP/2.0 200 OK\r\n\r\n{}'
+  exit 0
+fi
 if [ "${*: -1}" = user ]; then
   jq -n --arg login "${FAKE_LOGIN:-me}" '{login:$login}'
   exit 0
@@ -136,8 +145,88 @@ out=$(run_check 2000000000)
 [ -z "$out" ] || fail 'ci_activity produced a check line'
 [ -z "$("$SCRIPT" --state-dir "$TMP/state" pending)" ] || fail 'ci_activity entered pending output'
 [ "$(jq '.seen|length' "$TMP/state/github-notifications.json")" -eq 2 ] || fail 'ci_activity did not advance dedup state'
-[ "$(jq '(.external|length) + .excluded_count' "$TMP/state/github-notifications.json")" -eq 0 ] || fail 'ci_activity entered durable pending state'
+[ "$(jq '(.external|length) + (.excluded|length)' "$TMP/state/github-notifications.json")" -eq 0 ] || fail 'ci_activity entered durable pending state'
 ok 'ci_activity advances dedup state without surfacing'
+
+reset_case
+{
+  notification 50 2025-01-01T00:00:00Z secret/private secret-owner true 'PRIVATE-TITLE' 'PRIVATE-BODY'
+  notification 51 2025-01-01T00:00:01Z public/project public false 'PUBLIC-TITLE' 'PUBLIC-BODY'
+} | response "$TMP/responses/1.json"
+cp "$TMP/responses/1.json" "$TMP/responses/default.json"
+run_check 2000000000 >/dev/null
+[ "$(jq '[.excluded[].id] | index("50") != null' "$TMP/state/github-notifications.json")" = true ] \
+  || fail 'excluded record did not retain thread id'
+state=$(cat "$TMP/state/github-notifications.json")
+case "$state" in *PRIVATE-TITLE*|*secret/private*|*secret-owner*) fail 'excluded id storage leaked private details' ;; esac
+pending=$($SCRIPT --state-dir "$TMP/state" pending)
+case "$pending" in *'excluded count=1'*) ;; *) fail 'excluded count line missing' ;; esac
+case "$pending" in *50*) fail 'excluded thread id leaked in pending output' ;; esac
+ok 'excluded records retain id without leaking private details'
+
+reset_case
+notification 60 2025-01-01T00:00:00Z public/project public false 'TITLE' ignored | response "$TMP/responses/1.json"
+cp "$TMP/responses/1.json" "$TMP/responses/default.json"
+run_check 2000000000 >/dev/null
+"$SCRIPT" --state-dir "$TMP/state" check >/dev/null
+"$SCRIPT" --state-dir "$TMP/state" pending >/dev/null
+"$SCRIPT" --state-dir "$TMP/state" ack
+"$SCRIPT" --state-dir "$TMP/state" show >/dev/null
+grep -q -- '--method PATCH' "$TMP/log" && fail 'read-only verbs issued PATCH'
+ok 'check, pending, show, and ack never PATCH GitHub'
+
+reset_case
+{
+  notification 70 2025-01-01T00:00:00Z public/a public false 'A' ignored
+  notification 71 2025-01-01T00:00:01Z public/b public false 'B' ignored
+} | response "$TMP/responses/1.json"
+cp "$TMP/responses/1.json" "$TMP/responses/default.json"
+run_check 2000000000 >/dev/null
+out=$("$SCRIPT" --state-dir "$TMP/state" mark-read)
+[ "$out" = 'mark-read: would mark 2 threads read on GitHub' ] || fail 'dry-run count wrong'
+grep -q -- '--method PATCH' "$TMP/log" && fail 'dry-run mark-read issued PATCH'
+ok 'mark-read without --yes prints count and makes no mutating call'
+
+reset_case
+{
+  notification 80 2025-01-01T00:00:00Z public/a public false 'A' ignored
+  notification 81 2025-01-01T00:00:01Z secret/private secret true 'PRIVATE' ignored
+} | response "$TMP/responses/1.json"
+cp "$TMP/responses/1.json" "$TMP/responses/default.json"
+run_check 2000000000 >/dev/null
+out=$("$SCRIPT" --state-dir "$TMP/state" mark-read --yes)
+[ "$out" = 'mark-read: marked=2 failed=0 remaining=0' ] || fail 'mark-read success summary wrong'
+grep -c -- '--method PATCH notifications/threads/' "$TMP/log" | grep -qx 2 || fail 'mark-read did not PATCH both pending threads'
+[ -z "$("$SCRIPT" --state-dir "$TMP/state" pending)" ] || fail 'mark-read did not clear pending'
+ok 'mark-read with --yes PATCHes pending threads and clears local projection'
+
+reset_case
+{
+  notification 90 2025-01-01T00:00:00Z public/a public false 'A' ignored
+  notification 91 2025-01-01T00:00:01Z public/b public false 'B' ignored
+  notification 92 2025-01-01T00:00:02Z public/c public false 'C' ignored
+} | response "$TMP/responses/1.json"
+cp "$TMP/responses/1.json" "$TMP/responses/default.json"
+run_check 2000000000 >/dev/null
+printf '91\n' > "$TMP/patch-fail"
+export FAKE_PATCH_FAIL="$TMP/patch-fail"
+set +e
+out=$("$SCRIPT" --state-dir "$TMP/state" mark-read --yes 2>/dev/null)
+status=$?
+set -e
+[ "$status" -ne 0 ] || fail 'mid-way failure did not exit nonzero'
+[ "$out" = 'mark-read: marked=1 failed=1 remaining=2' ] || fail "partial failure summary wrong: $out"
+pending=$("$SCRIPT" --state-dir "$TMP/state" pending)
+case "$pending" in *'id=90'*) fail 'first success was not cleared locally' ;; esac
+case "$pending" in *'id=91'*) ;; *) fail 'failed thread did not remain pending' ;; esac
+case "$pending" in *'id=92'*) ;; *) fail 'unprocessed thread did not remain pending' ;; esac
+rm -f "$TMP/patch-fail"
+out=$("$SCRIPT" --state-dir "$TMP/state" mark-read --yes)
+[ "$out" = 'mark-read: marked=2 failed=0 remaining=0' ] || fail 'resume summary wrong'
+[ -z "$("$SCRIPT" --state-dir "$TMP/state" pending)" ] || fail 'resume did not clear remaining pending'
+patch_count=$(grep -c -- '--method PATCH notifications/threads/' "$TMP/log" || true)
+[ "$patch_count" -eq 4 ] || fail "resume did not PATCH only remaining threads: $patch_count"
+ok 'partial mark-read failure resumes and PATCHes only remaining threads'
 
 reset_case
 printf '[]\n' > "$TMP/responses/default.json"
