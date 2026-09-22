@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# github-open-prs - monitor, list, and close open pull requests.
+#
+# Usage:
+#   github-open-prs [options] check
+#   github-open-prs [options] pending
+#   github-open-prs [options] show
+#   github-open-prs [options] [list]
+#   github-open-prs [options] close [--yes] owner/repo#N [...]
+#   github-open-prs --help
+#
+# Options:
+#   --state-dir DIR   Store state in DIR (default: $OSS_MATE_STATE_DIR or
+#                     $XDG_STATE_HOME/oss-mate, falling back to ~/.local/state/oss-mate).
+#   --config FILE     Read owned-elsewhere JSON (default: $OSS_MATE_OWNED_CONFIG,
+#                     or DIR/github-notifications-owned.json when unset).
+#   --budget SECONDS  Bound a run (default: $OSS_MATE_CHECK_BUDGET or 20; 1..25).
+#   --stale           Keep only pull requests that are not mergeable into the base branch.
+#
+# Checks poll at most once daily by default, controlled by OSS_MATE_MIN_POLL_SECONDS (default 86400).
+# Daily is enough because the goal is never losing track of a relevant pull request, not real-time response.
+#
+# Stale means the pull request is not mergeable into its repository default branch per GitHub's
+# mergeable field, never from age, inactivity, or commits-behind; unknown or computing states are not stale.
+#
+# Files:
+#   DIR/github-open-prs.json           Atomic mode-0600 inventory snapshot and poll gate.
+#   DIR/.github-open-prs.lock          Directory used to serialize checks.
+#   FILE                                Optional {"owners":["owner"],"repositories":["owner/repo"]}.
+#
+# Sets:
+#   mine lists open pull requests the authenticated user authored in repositories they do not own.
+#   theirs lists open pull requests from other authors in repositories owned by the authenticated user.
+#   Private repositories and config-excluded entries are counted only, never named or titled.
+#
+# Output:
+#   check prints exactly one line only when there is anything to review:
+#     github open prs: mine=N (action=N stale=N new-stale=N) theirs=N (new=N stale=N) excluded=N; run github-open-prs pending
+#   Print nothing and make no API call when gated or when both public sets are empty with no excluded count.
+#   pending and show print one redacted line per open public pull request.
+#   Authored pull requests include mergeability status new-stale, still-stale, mergeable, or unknown.
+#   Authored pull requests also include action when attention is needed: stale, changes-requested,
+#   checks-failing, and new-activity, as a comma-separated list derived read-only from GitHub data.
+#   Pull requests opened by others in owned repositories use status new when absent from the previous snapshot.
+#   Unknown or computing mergeability is never stale.
+#   list prints the current inventory without status, action, or durable state; --stale filters list only.
+#   When nonzero, one count line per set for private and config-excluded repositories:
+#     {set} private count=N
+#
+# close closes only explicitly named owner/repo#N pull requests that are open, stale, and self-authored.
+# Without --yes it prints the exact pull requests it would close and makes no mutation.
+# check, pending, show, and list never invoke close or mutate a repository.
+# close never runs from check, pending, show, or list and has no bulk or --all form.
+set -eu
+export LC_ALL=C
+
+fail() { printf 'github-open-prs: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -eu$/s/^# \{0,1\}//p' "$0"; }
+
+STATE_DIR=${OSS_MATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oss-mate}
+CONFIG=${OSS_MATE_OWNED_CONFIG:-}
+BUDGET=${OSS_MATE_CHECK_BUDGET:-20}
+STALE_ONLY=0
+YES=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --state-dir) [ "$#" -ge 2 ] || fail '--state-dir needs a value'; STATE_DIR=$2; shift 2 ;;
+    --config) [ "$#" -ge 2 ] || fail '--config needs a value'; CONFIG=$2; shift 2 ;;
+    --budget) [ "$#" -ge 2 ] || fail '--budget needs a value'; BUDGET=$2; shift 2 ;;
+    --stale) STALE_ONLY=1; shift ;;
+    --yes) YES=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    check) ACTION=$1; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments'; break ;;
+    pending|show) ACTION=$1; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments'; break ;;
+    list) ACTION=list; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments after list'; break ;;
+    close)
+      ACTION=close
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --yes) YES=1; shift ;;
+          -*) fail "unknown argument: $1" ;;
+          *) break ;;
+        esac
+      done
+      break
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+ACTION=${ACTION:-list}
+case "$BUDGET" in ''|*[!0-9]*) fail '--budget must be a whole number from 1 to 25' ;; esac
+[ "$BUDGET" -ge 1 ] && [ "$BUDGET" -le 25 ] || fail '--budget must be a whole number from 1 to 25'
+[ -n "$CONFIG" ] || CONFIG="$STATE_DIR/github-notifications-owned.json"
+RECORD="$STATE_DIR/github-open-prs.json"
+LOCK="$STATE_DIR/.github-open-prs.lock"
+SCHEMA=oss-mate-github-open-prs-v1
+MIN_POLL=${OSS_MATE_MIN_POLL_SECONDS:-86400}
+NOW=${OSS_MATE_NOW:-$(date +%s)}
+case "$NOW:$MIN_POLL" in *[!0-9:]*) fail 'time settings must be whole seconds' ;; esac
+command -v jq >/dev/null 2>&1 || fail 'jq is required'
+command -v gh >/dev/null 2>&1 || fail 'gh is required'
+
+validate_config() {
+  [ -e "$CONFIG" ] || return 0
+  [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail 'owned-elsewhere config must be a regular file'
+  jq -e 'type=="object" and ((.owners // [])|type)=="array" and
+    ((.repositories // [])|type)=="array" and
+    all((.owners // [])[]; type=="string" and length>0) and
+    all((.repositories // [])[]; type=="string" and test("^[^/]+/[^/]+$"))' "$CONFIG" >/dev/null 2>&1 \
+    || fail 'owned-elsewhere config is invalid'
+}
+empty_state() {
+  jq -n --arg schema "$SCHEMA" \
+    '{schema:$schema,next_poll:0,login:null,mine:[],theirs:[],mine_private:0,theirs_private:0,previous:{mine:{},theirs:{}}}'
+}
+PR_RECORD_FIELDS='(.set|type)=="string" and (.repo|type)=="string" and (.number|type)=="number" and
+   (.author|type)=="string" and (.mergeability|type)=="string" and (.title|type)=="string" and
+   (.updated_at|type)=="string" and (.changes_requested|type)=="boolean" and (.checks_failing|type)=="boolean"'
+validate_state() {
+  jq -e --arg schema "$SCHEMA" "
+    .schema == \$schema and (.login == null or (.login|type)==\"string\") and
+    (.next_poll|type)==\"number\" and (.mine|type)==\"array\" and (.theirs|type)==\"array\" and
+    all(.mine[]; $PR_RECORD_FIELDS) and
+    all(.theirs[]; (.set|type)==\"string\" and (.repo|type)==\"string\" and (.number|type)==\"number\" and
+      (.author|type)==\"string\" and (.mergeability|type)==\"string\" and (.title|type)==\"string\") and
+    (.mine_private|type)==\"number\" and (.theirs_private|type)==\"number\" and
+    (.previous|type)==\"object\" and (.previous.mine|type)==\"object\" and (.previous.theirs|type)==\"object\"
+  " "$1" >/dev/null 2>&1
+}
+mine_status_jq='
+  def pr_key: .repo + "#" + (.number|tostring);
+  def prev_mine($state; $key):
+    ($state.previous.mine[$key] // null);
+  def mine_status($state):
+    (pr_key) as $key |
+    (prev_mine($state; $key) | if type=="object" then .mergeability else . end) as $prev |
+    if .mergeability == "stale" then
+      if $prev == "mergeable" or $prev == null then "new-stale"
+      elif $prev == "stale" then "still-stale"
+      else "new-stale" end
+    elif .mergeability == "mergeable" then "mergeable"
+    else "unknown" end;
+  def mine_action($state):
+    (pr_key) as $key |
+    (prev_mine($state; $key)) as $prev |
+    ([
+      (if .mergeability == "stale" then "stale" else empty end),
+      (if .changes_requested then "changes-requested" else empty end),
+      (if .checks_failing then "checks-failing" else empty end),
+      (if ($prev|type)=="object" and ($prev.updated_at|type)=="string" and (.updated_at > $prev.updated_at)
+       then "new-activity" else empty end)
+    ] | join(","));
+'
+show_pending() {
+  [ -f "$RECORD" ] || exit 0
+  validate_state "$RECORD" || fail 'state file is invalid'
+  jq -r "$mine_status_jq"'. as $state |
+    ($state.mine[] |
+      (mine_status($state)) as $status |
+      (mine_action($state)) as $action |
+      (if $action == "" then "" else " action=\($action)" end) as $action_suffix |
+      "mine repository=\(.repo) number=\(.number) author=\(.author) mergeability=\(.mergeability) status=\($status)\($action_suffix) title=\(.title|@json)"),
+    ($state.theirs[] |
+      ((.repo + "#" + (.number|tostring)) as $key |
+      (if ($state.previous.theirs[$key] // null) == null then " status=new" else "" end) as $suffix |
+      "theirs repository=\(.repo) number=\(.number) author=\(.author) mergeability=\(.mergeability)\($suffix) title=\(.title|@json)")),
+    ($state | select(.mine_private > 0) | "mine private count=\(.mine_private)"),
+    ($state | select(.theirs_private > 0) | "theirs private count=\(.theirs_private)")' "$RECORD"
+}
+if [ "$ACTION" = pending ] || [ "$ACTION" = show ]; then show_pending; exit 0; fi
+
+validate_config
+
+TMPDIR_RUN=$(mktemp -d "${TMPDIR:-/tmp}/github-open-prs.XXXXXX")
+cleanup() { rm -rf -- "$TMPDIR_RUN" "${LOCK:-}"; }
+trap cleanup EXIT HUP INT TERM
+
+DEADLINE=$(( $(date +%s) + BUDGET ))
+budget_remain() {
+  REMAIN=$((DEADLINE - $(date +%s)))
+  [ "$REMAIN" -gt 0 ] || fail 'budget exhausted'
+  printf '%s' "$REMAIN"
+}
+gh_get() {
+  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET "$1" > "$2" \
+    || fail "GitHub read failed for $1"
+}
+gh_graphql() {
+  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh api graphql -f query="$1" -f owner="$2" -f name="$3" -F number="$4" > "$5" \
+    || fail "GitHub GraphQL read failed for $2/$3#$4"
+}
+gh_patch() {
+  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "$1" -f state=closed > "$2" \
+    || fail "GitHub close failed for $1"
+}
+
+mergeability_verdict() {
+  jq -r 'if .mergeable == true then "mergeable"
+         elif .mergeable == false then "stale"
+         else "unknown" end'
+}
+mergeability_from_graphql() {
+  jq -r 'if .data.repository.pullRequest.mergeable == "MERGEABLE" then "mergeable"
+         elif .data.repository.pullRequest.mergeable == "CONFLICTING" then "stale"
+         else "unknown" end'
+}
+
+is_excluded() {
+  jq -en --arg repo "$1" --arg owner "$2" --slurpfile config "$TMPDIR_RUN/config.json" '
+    any(($config[0].owners // [])[]; ascii_downcase == ($owner | ascii_downcase)) or
+    any(($config[0].repositories // [])[]; ascii_downcase == ($repo | ascii_downcase))
+  ' >/dev/null 2>&1
+}
+is_own_repo() {
+  [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" ]
+}
+
+parse_ref() {
+  case "$1" in
+    */*#[0-9]*) ;;
+    *) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;;
+  esac
+  REF_REPO=${1%#*}
+  REF_NUM=${1##*#}
+  case "$REF_REPO" in */*) ;; *) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;; esac
+  case "$REF_NUM" in *[!0-9]*) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;; esac
+}
+
+search_collect() {
+  query=$1
+  outfile=$2
+  : > "$TMPDIR_RUN/$outfile.jsonl"
+  page=0
+  while :; do
+    page=$((page + 1))
+    [ "$page" -le 10 ] || fail "search pagination exceeded 10 pages for $query"
+    gh_get "/search/issues?q=$(printf '%s' "$query" | jq -sRr @uri)&per_page=100&page=$page" \
+      "$TMPDIR_RUN/search-$outfile-$page.json"
+    jq -e '.items | type == "array"' "$TMPDIR_RUN/search-$outfile-$page.json" >/dev/null 2>&1 \
+      || fail "GitHub returned an invalid search page for $query"
+    jq -c '.items[]' "$TMPDIR_RUN/search-$outfile-$page.json" >> "$TMPDIR_RUN/$outfile.jsonl"
+    total=$(jq -r '.total_count // 0' "$TMPDIR_RUN/search-$outfile-$page.json")
+    count=$(jq -s 'length' "$TMPDIR_RUN/$outfile.jsonl")
+    [ "$count" -lt "$total" ] && [ "$(jq '.items | length' "$TMPDIR_RUN/search-$outfile-$page.json")" -eq 100 ] || break
+  done
+}
+
+MINE_PR_QUERY='query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    isPrivate
+    pullRequest(number: $number) {
+      number title updatedAt mergeable reviewDecision
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    }
+  }
+}'
+
+collect_inventory() {
+  if [ -e "$CONFIG" ]; then
+    cp "$CONFIG" "$TMPDIR_RUN/config.json"
+  else
+    printf '{"owners":[],"repositories":[]}\n' > "$TMPDIR_RUN/config.json"
+  fi
+  gh_get user "$TMPDIR_RUN/user.json"
+  LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+    || fail 'authenticated-user lookup returned an invalid login'
+  search_collect "is:pr+is:open+author:${LOGIN}+-user:${LOGIN}" mine
+  search_collect "is:pr+is:open+user:${LOGIN}+-author:${LOGIN}" theirs
+  jq -nc \
+    --argjson mine "$(jq -s '.' "$TMPDIR_RUN/mine.jsonl" 2>/dev/null || printf '[]')" \
+    --argjson theirs "$(jq -s '.' "$TMPDIR_RUN/theirs.jsonl" 2>/dev/null || printf '[]')" \
+    '[{set:"mine",rows:$mine},{set:"theirs",rows:$theirs}]' > "$TMPDIR_RUN/bundles.json"
+  jq -c '
+    def repo_name: sub("^https://api.github.com/repos/"; "");
+    def row($set):
+      .repository_url as $url | ($url | repo_name) as $repo | ($repo | split("/")) as $parts |
+      {set:$set, repo:$repo, owner:$parts[0], number:.number, title:.title, author_login:.user.login};
+    .[] | .set as $set | .rows[] | row($set)
+  ' "$TMPDIR_RUN/bundles.json" > "$TMPDIR_RUN/items.jsonl"
+  mine_private=0
+  theirs_private=0
+  : > "$TMPDIR_RUN/mine-records.jsonl"
+  : > "$TMPDIR_RUN/theirs-records.jsonl"
+  : > "$TMPDIR_RUN/details.jsonl"
+  while IFS= read -r item; do
+    set_tag=$(jq -r '.set' <<<"$item")
+    repo=$(jq -r '.repo' <<<"$item")
+    owner=$(jq -r '.owner' <<<"$item")
+    number=$(jq -r '.number' <<<"$item")
+    if [ "$set_tag" = mine ] && is_own_repo "$LOGIN" "$owner"; then
+      continue
+    fi
+    if [ "$set_tag" = mine ]; then
+      repo_name=${repo#*/}
+      gh_graphql "$MINE_PR_QUERY" "$owner" "$repo_name" "$number" "$TMPDIR_RUN/gql-mine-$number.json"
+      gql="$TMPDIR_RUN/gql-mine-$number.json"
+      private=$(jq -r '.data.repository.isPrivate // false' "$gql")
+      if [ "$private" = true ] || is_excluded "$repo" "$owner"; then
+        mine_private=$((mine_private + 1))
+        continue
+      fi
+      verdict=$(mergeability_from_graphql < "$gql")
+      if [ "$STALE_ONLY" -eq 1 ] && [ "$verdict" != stale ]; then
+        continue
+      fi
+      bounded_title=$(jq -r '.data.repository.pullRequest.title | gsub("[\u0000-\u001f\u007f]"; " ") | .[0:160] | @json' "$gql")
+      updated_at=$(jq -r '.data.repository.pullRequest.updatedAt' "$gql")
+      changes_requested=$(jq -r '.data.repository.pullRequest.reviewDecision == "CHANGES_REQUESTED"' "$gql")
+      checks_failing=$(jq -r '
+        (.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state // "") as $state |
+        ($state == "FAILURE" or $state == "ERROR")' "$gql")
+      record=$(jq -nc --arg set mine --arg repo "$repo" --argjson number "$number" \
+        --arg author self --arg mergeability "$verdict" --argjson title "$bounded_title" \
+        --arg updated_at "$updated_at" --argjson changes_requested "$changes_requested" \
+        --argjson checks_failing "$checks_failing" \
+        '{set:$set,repo:$repo,number:$number,author:$author,mergeability:$mergeability,title:$title,
+          updated_at:$updated_at,changes_requested:$changes_requested,checks_failing:$checks_failing}')
+      printf '%s\n' "$record" >> "$TMPDIR_RUN/mine-records.jsonl"
+      jq -nc --arg set mine --arg repo "$repo" --argjson number "$number" \
+        --arg author self --arg mergeability "$verdict" --argjson title "$bounded_title" \
+        '{set:$set,repo:$repo,number:$number,author:$author,mergeability:$mergeability,title:$title}' \
+        >> "$TMPDIR_RUN/details.jsonl"
+      continue
+    fi
+    gh_get "repos/$repo/pulls/$number" "$TMPDIR_RUN/pull-$set_tag-$number.json"
+    pull="$TMPDIR_RUN/pull-$set_tag-$number.json"
+    private=$(jq -r '.base.repo.private // false' "$pull")
+    if [ "$private" = true ] || is_excluded "$repo" "$owner"; then
+      theirs_private=$((theirs_private + 1))
+      continue
+    fi
+    verdict=$(mergeability_verdict < "$pull")
+    bounded_title=$(jq -r '.title | gsub("[\u0000-\u001f\u007f]"; " ") | .[0:160] | @json' "$pull")
+    record=$(jq -nc --arg set theirs --arg repo "$repo" --argjson number "$number" \
+      --arg author other --arg mergeability "$verdict" --argjson title "$bounded_title" \
+      '{set:$set,repo:$repo,number:$number,author:$author,mergeability:$mergeability,title:$title}')
+    printf '%s\n' "$record" >> "$TMPDIR_RUN/theirs-records.jsonl"
+    jq -nc --arg set theirs --arg repo "$repo" --argjson number "$number" \
+      --arg author other --arg mergeability "$verdict" --argjson title "$bounded_title" \
+      '{set:$set,repo:$repo,number:$number,author:$author,mergeability:$mergeability,title:$title}' \
+      >> "$TMPDIR_RUN/details.jsonl"
+  done < "$TMPDIR_RUN/items.jsonl"
+  jq -s '.' "$TMPDIR_RUN/mine-records.jsonl" 2>/dev/null > "$TMPDIR_RUN/mine-array.json" \
+    || printf '[]\n' > "$TMPDIR_RUN/mine-array.json"
+  jq -s '.' "$TMPDIR_RUN/theirs-records.jsonl" 2>/dev/null > "$TMPDIR_RUN/theirs-array.json" \
+    || printf '[]\n' > "$TMPDIR_RUN/theirs-array.json"
+  jq -n --arg login "$LOGIN" \
+    --argjson mine "$(cat "$TMPDIR_RUN/mine-array.json")" \
+    --argjson theirs "$(cat "$TMPDIR_RUN/theirs-array.json")" \
+    --argjson mine_private "$mine_private" --argjson theirs_private "$theirs_private" \
+    '{login:$login,mine:$mine,theirs:$theirs,mine_private:$mine_private,theirs_private:$theirs_private}'
+}
+
+if [ "$ACTION" = close ]; then
+  gh_get user "$TMPDIR_RUN/user.json"
+  LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+    || fail 'authenticated-user lookup returned an invalid login'
+  [ "$#" -gt 0 ] || fail 'close requires at least one owner/repo#number argument'
+  REFS=()
+  while [ "$#" -gt 0 ]; do parse_ref "$1"; REFS+=("$1"); shift; done
+  TO_CLOSE=()
+  for ref in "${REFS[@]}"; do
+    repo=${ref%#*}
+    num=${ref##*#}
+    gh_get "repos/$repo/pulls/$num" "$TMPDIR_RUN/close-$num.json"
+    pr="$TMPDIR_RUN/close-$num.json"
+    if [ "$(jq -r '.user.login // ""' "$pr" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$LOGIN" | tr '[:upper:]' '[:lower:]')" ]; then
+      author=$(jq -r '.user.login // "unknown"' "$pr")
+      fail "refusing close: $ref is not authored by the authenticated user (author=$author)"
+    fi
+    if [ "$(jq -r '.state // ""' "$pr")" != open ]; then
+      state=$(jq -r '.state // "unknown"' "$pr")
+      fail "refusing close: $ref is not open (state=$state)"
+    fi
+    verdict=$(mergeability_verdict < "$pr")
+    if [ "$verdict" != stale ]; then
+      fail "refusing close: $ref is not stale (mergeability=$verdict)"
+    fi
+    TO_CLOSE+=("$ref")
+  done
+  if [ "$YES" -eq 0 ]; then
+    printf 'would close:'
+    for ref in "${TO_CLOSE[@]}"; do printf ' %s' "$ref"; done
+    printf '\n'
+    exit 0
+  fi
+  for ref in "${TO_CLOSE[@]}"; do
+    repo=${ref%#*}
+    num=${ref##*#}
+    gh_patch "repos/$repo/pulls/$num" "$TMPDIR_RUN/closed-$num.json"
+  done
+  exit 0
+fi
+
+if [ "$ACTION" = check ]; then
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    exit 0
+  fi
+  CHECK_TMP=$(mktemp -d "$STATE_DIR/.github-open-prs.XXXXXX")
+  cleanup_check() { rm -rf -- "$CHECK_TMP" "$LOCK"; }
+  trap cleanup_check EXIT HUP INT TERM
+  if [ -f "$RECORD" ]; then
+    validate_state "$RECORD" || fail 'state file is invalid'
+    cp "$RECORD" "$CHECK_TMP/old.json"
+  else
+    empty_state > "$CHECK_TMP/old.json"
+  fi
+  NEXT=$(jq -r .next_poll "$CHECK_TMP/old.json")
+  [ "$NOW" -ge "$NEXT" ] || exit 0
+  TMPDIR_RUN=$CHECK_TMP
+  DEADLINE=$(( $(date +%s) + BUDGET ))
+  collect_inventory > "$CHECK_TMP/inventory.json"
+  jq -n --arg schema "$SCHEMA" --argjson next "$((NOW + MIN_POLL))" \
+    --slurpfile old "$CHECK_TMP/old.json" --slurpfile inv "$CHECK_TMP/inventory.json" \
+    "$mine_status_jq"'
+    def prev_mine_map:
+      [ $old[0].mine[]? |
+        {key:(.repo + "#" + (.number|tostring)), value:{mergeability:.mergeability,updated_at:.updated_at}} ] |
+      map({(.key): .value}) | add // {};
+    def prev_theirs_map:
+      [ $old[0].theirs[]? | (.repo + "#" + (.number|tostring)) ] |
+      map({(.): true}) | add // {};
+    def mine_new_stale($row):
+      (.repo + "#" + (.number|tostring)) as $key |
+      ([ $old[0].mine[]? | select((.repo + "#" + (.number|tostring)) == $key) | .mergeability][0] // null) as $prev |
+      (.mergeability == "stale") and ($prev == "mergeable" or $prev == null);
+    def mine_action_count($row; $prev_map):
+      (.repo + "#" + (.number|tostring)) as $key |
+      ($prev_map[$key] // null) as $prev |
+      ([
+        (if .mergeability == "stale" then 1 else empty end),
+        (if .changes_requested then 1 else empty end),
+        (if .checks_failing then 1 else empty end),
+        (if ($prev|type)=="object" and ($prev.updated_at|type)=="string" and (.updated_at > $prev.updated_at)
+         then 1 else empty end)
+      ] | length) > 0;
+    def theirs_new($row; $prev_map):
+      ($prev_map[.repo + "#" + (.number|tostring)] // null) == null;
+    $inv[0] as $inv |
+    (prev_mine_map) as $prev_mine |
+    (prev_theirs_map) as $prev_theirs |
+    ($inv.mine | length) as $mine_n |
+    ($inv.mine | map(select(mine_action_count(.; $prev_mine))) | length) as $mine_action |
+    ($inv.mine | map(select(.mergeability == "stale")) | length) as $mine_stale |
+    ($inv.mine | map(select(mine_new_stale(.))) | length) as $mine_new_stale |
+    ($inv.theirs | length) as $theirs_n |
+    ($inv.theirs | map(select(theirs_new(.; $prev_theirs))) | length) as $theirs_new |
+    ($inv.theirs | map(select(.mergeability == "stale")) | length) as $theirs_stale |
+    ($inv.mine_private + $inv.theirs_private) as $excluded |
+    {
+      schema:$schema,
+      next_poll:$next,
+      login:$inv.login,
+      mine:$inv.mine,
+      theirs:$inv.theirs,
+      mine_private:$inv.mine_private,
+      theirs_private:$inv.theirs_private,
+      previous:{mine:$prev_mine,theirs:$prev_theirs},
+      _mine_n:$mine_n,
+      _mine_action:$mine_action,
+      _mine_stale:$mine_stale,
+      _mine_new_stale:$mine_new_stale,
+      _theirs_n:$theirs_n,
+      _theirs_new:$theirs_new,
+      _theirs_stale:$theirs_stale,
+      _excluded:$excluded
+    }
+  ' > "$CHECK_TMP/new-with-counts.json"
+  MINE_N=$(jq -r ._mine_n "$CHECK_TMP/new-with-counts.json")
+  MINE_ACTION=$(jq -r ._mine_action "$CHECK_TMP/new-with-counts.json")
+  MINE_STALE=$(jq -r ._mine_stale "$CHECK_TMP/new-with-counts.json")
+  MINE_NEW_STALE=$(jq -r ._mine_new_stale "$CHECK_TMP/new-with-counts.json")
+  THEIRS_N=$(jq -r ._theirs_n "$CHECK_TMP/new-with-counts.json")
+  THEIRS_NEW=$(jq -r ._theirs_new "$CHECK_TMP/new-with-counts.json")
+  THEIRS_STALE=$(jq -r ._theirs_stale "$CHECK_TMP/new-with-counts.json")
+  EXCLUDED=$(jq -r ._excluded "$CHECK_TMP/new-with-counts.json")
+  jq 'del(._mine_n,._mine_action,._mine_stale,._mine_new_stale,._theirs_n,._theirs_new,._theirs_stale,._excluded)' \
+    "$CHECK_TMP/new-with-counts.json" > "$CHECK_TMP/publish.json"
+  chmod 600 "$CHECK_TMP/publish.json"
+  mv -f -- "$CHECK_TMP/publish.json" "$RECORD"
+  if [ "$MINE_N" -gt 0 ] || [ "$THEIRS_N" -gt 0 ] || [ "$EXCLUDED" -gt 0 ]; then
+    printf 'github open prs: mine=%s (action=%s stale=%s new-stale=%s) theirs=%s (new=%s stale=%s) excluded=%s; run github-open-prs pending\n' \
+      "$MINE_N" "$MINE_ACTION" "$MINE_STALE" "$MINE_NEW_STALE" "$THEIRS_N" "$THEIRS_NEW" "$THEIRS_STALE" "$EXCLUDED"
+  fi
+  exit 0
+fi
+
+collect_inventory > "$TMPDIR_RUN/inventory.json"
+if [ -s "$TMPDIR_RUN/details.jsonl" ]; then
+  jq -r '. as $row |
+    "\($row.set) repository=\($row.repo) number=\($row.number) author=\($row.author) mergeability=\($row.mergeability) title=\($row.title|@json)"' \
+    "$TMPDIR_RUN/details.jsonl" | LC_ALL=C sort
+fi
+mine_private=$(jq -r .mine_private "$TMPDIR_RUN/inventory.json")
+theirs_private=$(jq -r .theirs_private "$TMPDIR_RUN/inventory.json")
+if [ "$mine_private" -gt 0 ]; then printf 'mine private count=%s\n' "$mine_private"; fi
+if [ "$theirs_private" -gt 0 ]; then printf 'theirs private count=%s\n' "$theirs_private"; fi
+exit 0

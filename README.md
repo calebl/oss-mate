@@ -34,17 +34,22 @@ No notification body or comment text is fetched, printed, or persisted.
 Private and config-listed repository names and subject titles are neither printed nor persisted.
 Subject titles from public external repositories are untrusted display data, stripped of control characters, and limited to 160 characters.
 
-## Stale pull request monitor
+## Open pull request monitor
 
-`bin/github-stale-prs` lists open pull requests authored by the authenticated user anywhere and pull requests opened by other people in repositories owned by the authenticated user.
+`bin/github-open-prs` tracks open pull requests the authenticated user authored in repositories they do not own, and open pull requests from other authors in repositories the authenticated user owns.
 It uses the logged-in `gh` CLI, resolves the authenticated login once per run read-only, and never prints it.
 Stale means the pull request is not mergeable into its repository default branch per GitHub's mergeable field, never from age, inactivity, or commits-behind.
 The default `list` verb prints one redacted line per open public pull request with a set tag (`mine` or `theirs`), repository, number, author flag, mergeability verdict, and a bounded title.
 Private repositories and entries matched by the optional owned-elsewhere config file are reported only as a per-set count, never by name or title.
 The same config path convention as the notification monitor applies: default `github-notifications-owned.json` in the state directory, overridable with `--config` or `$OSS_MATE_OWNED_CONFIG`.
-Pass `--stale` to keep only pull requests whose mergeability verdict is stale; unknown or still-computing states are reported as unknown and are never treated as stale.
+Pass `--stale` to keep only pull requests whose mergeability verdict is stale on `list`; unknown or still-computing states are reported as unknown and are never treated as stale.
+The `check` verb performs the same two-set inventory read-only, compares it against a durable previous snapshot in `github-open-prs.json` under its state directory, and prints one summary line when there is anything to review.
+The `pending` and `show` verbs print every open public pull request with mergeability status for authored pull requests (`new-stale`, `still-stale`, `mergeable`, or `unknown`) and an `action` list when attention is needed (`stale`, `changes-requested`, `checks-failing`, or `new-activity`).
+Pull requests opened by others in owned repositories are flagged `new` when absent from the previous snapshot.
+The default state directory matches the notification monitor: `$OSS_MATE_STATE_DIR`, then `$XDG_STATE_HOME/oss-mate`, then `~/.local/state/oss-mate`.
+Checks poll at most once daily by default, controlled by `OSS_MATE_MIN_POLL_SECONDS` (default 86400).
 The `close` verb closes only explicitly named `owner/repo#number` pull requests that are open, stale, and self-authored; without `--yes` it prints the exact pull requests it would close and makes no mutation.
-Listing and filtering are read-only; `close` is the only mutation and has no bulk or `--all` form.
+`check`, `pending`, `show`, and `list` are read-only; `close` is the only mutation and has no bulk or `--all` form.
 The default budget is 20 seconds and can be changed with `--budget`.
 The script header and `--help` are the authoritative interface reference.
 
@@ -52,16 +57,19 @@ The script header and `--help` are the authoritative interface reference.
 
 The `check` verb prints one line only when something new surfaced, so any scheduler or agent hook can run it.
 Daily is enough because the goal is never losing track of a relevant thread, not real-time response.
-The following cron entry runs the check once daily at 09:00 with explicit durable state and config paths.
+The following cron entries run both checks once daily at 09:00 with explicit durable state and config paths.
+Both tools can be reviewed in the same daily pass; notification mark-read remains explicit and separate.
 
 ```cron
 0 9 * * * /absolute/path/to/oss-mate/bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" --config "$HOME/.config/oss-mate/github-notifications-owned.json" check
+0 9 * * * /absolute/path/to/oss-mate/bin/github-open-prs --state-dir "$HOME/.local/state/oss-mate" --config "$HOME/.config/oss-mate/github-notifications-owned.json" check
 ```
 
-The script also enforces a daily minimum between API polls by default, so a more frequent caller stays silent without making an API call.
+Each script also enforces a daily minimum between API polls by default, so a more frequent caller stays silent without making an API call.
 `OSS_MATE_MIN_POLL_SECONDS` overrides that minimum when a different cadence is deliberately required, while GitHub's `X-Poll-Interval` remains an additional floor.
 The default budget is 20 seconds and can be changed with `--budget` when the calling system has a different execution limit.
-Run `bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" pending` to inspect the redacted durable details after a nonempty check result.
+Run `bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" pending` to inspect the redacted durable details after a nonempty notification check result.
+Run `bin/github-open-prs --state-dir "$HOME/.local/state/oss-mate" pending` after a nonempty open-pull-request check result.
 After the details have been classified and reported to the operator, run the same command with `ack` to clear the local pending projection while preserving the cursor and dedup set.
 `ack` does not mark anything read on GitHub.
 To mark the pending threads read on GitHub, run the same command with `mark-read --yes`.
@@ -70,10 +78,10 @@ Without `--yes`, `mark-read` prints how many pending threads would be marked rea
 Optional thread ids after `mark-read` narrow the set but never widen it beyond the current pending projection.
 `check`, `pending`, `show`, and `ack` never mark a thread read on GitHub.
 The non-user-invocable skill at `skills/github-notification-triage/SKILL.md` owns the generic read-only classification and summary procedure.
-For non-mergeable pull requests the authenticated user opened, `bin/github-stale-prs --stale list` and `close` are the supported read and explicit-close path.
+For non-mergeable pull requests the authenticated user opened, `bin/github-open-prs --stale list` and `close` are the supported read and explicit-close path.
 
 ## Development
 
-Run the executable behavior suite with `tests/github-notifications.test.sh` and `tests/github-stale-prs.test.sh`.
+Run the executable behavior suite with `tests/github-notifications.test.sh` and `tests/github-open-prs.test.sh`.
 Run `shellcheck bin/*` before proposing changes.
 Pull requests and pushes to `main` run the same shellcheck and behavior-test suite in GitHub Actions.
