@@ -179,20 +179,33 @@ trap cleanup EXIT HUP INT TERM
 DEADLINE=$(( $(date +%s) + BUDGET ))
 budget_remain() {
   REMAIN=$((DEADLINE - $(date +%s)))
-  [ "$REMAIN" -gt 0 ] || fail 'budget exhausted'
+  [ "$REMAIN" -gt 0 ] || return 1
   printf '%s' "$REMAIN"
 }
+budget_fail_pulls() {
+  printf 'github-open-prs: budget exhausted after %s of %s pull requests\n' "$1" "$2" >&2
+  exit 1
+}
 gh_get() {
-  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET "$1" > "$2" \
+  if ! remain=$(budget_remain); then
+    fail 'budget exhausted'
+  fi
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET "$1" > "$2" \
     || fail "GitHub read failed for $1"
 }
 gh_graphql() {
-  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+  if ! remain=$(budget_remain); then
+    fail 'budget exhausted'
+  fi
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
     gh api graphql -f query="$1" -f owner="$2" -f name="$3" -F number="$4" > "$5" \
     || fail "GitHub GraphQL read failed for $2/$3#$4"
 }
 gh_patch() {
-  timeout "$(budget_remain)" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "$1" -f state=closed > "$2" \
+  if ! remain=$(budget_remain); then
+    fail 'budget exhausted'
+  fi
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "$1" -f state=closed > "$2" \
     || fail "GitHub close failed for $1"
 }
 
@@ -266,12 +279,16 @@ collect_inventory() {
   gh_get user "$TMPDIR_RUN/user.json"
   LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
     || fail 'authenticated-user lookup returned an invalid login'
-  search_collect "is:pr+is:open+author:${LOGIN}+-user:${LOGIN}" mine
-  search_collect "is:pr+is:open+user:${LOGIN}+-author:${LOGIN}" theirs
+  search_collect "is:pr is:open author:${LOGIN} -user:${LOGIN}" mine
+  search_collect "is:pr is:open user:${LOGIN} -author:${LOGIN}" theirs
+  jq -s '.' "$TMPDIR_RUN/mine.jsonl" 2>/dev/null > "$TMPDIR_RUN/mine-search-array.json" \
+    || printf '[]\n' > "$TMPDIR_RUN/mine-search-array.json"
+  jq -s '.' "$TMPDIR_RUN/theirs.jsonl" 2>/dev/null > "$TMPDIR_RUN/theirs-search-array.json" \
+    || printf '[]\n' > "$TMPDIR_RUN/theirs-search-array.json"
   jq -nc \
-    --argjson mine "$(jq -s '.' "$TMPDIR_RUN/mine.jsonl" 2>/dev/null || printf '[]')" \
-    --argjson theirs "$(jq -s '.' "$TMPDIR_RUN/theirs.jsonl" 2>/dev/null || printf '[]')" \
-    '[{set:"mine",rows:$mine},{set:"theirs",rows:$theirs}]' > "$TMPDIR_RUN/bundles.json"
+    --slurpfile mine "$TMPDIR_RUN/mine-search-array.json" \
+    --slurpfile theirs "$TMPDIR_RUN/theirs-search-array.json" \
+    '[{set:"mine",rows:$mine[0]},{set:"theirs",rows:$theirs[0]}]' > "$TMPDIR_RUN/bundles.json"
   jq -c '
     def repo_name: sub("^https://api.github.com/repos/"; "");
     def row($set):
@@ -284,6 +301,16 @@ collect_inventory() {
   : > "$TMPDIR_RUN/mine-records.jsonl"
   : > "$TMPDIR_RUN/theirs-records.jsonl"
   : > "$TMPDIR_RUN/details.jsonl"
+  pr_total=0
+  pr_done=0
+  while IFS= read -r item; do
+    set_tag=$(jq -r '.set' <<<"$item")
+    owner=$(jq -r '.owner' <<<"$item")
+    if [ "$set_tag" = mine ] && is_own_repo "$LOGIN" "$owner"; then
+      continue
+    fi
+    pr_total=$((pr_total + 1))
+  done < "$TMPDIR_RUN/items.jsonl"
   while IFS= read -r item; do
     set_tag=$(jq -r '.set' <<<"$item")
     repo=$(jq -r '.repo' <<<"$item")
@@ -292,9 +319,13 @@ collect_inventory() {
     if [ "$set_tag" = mine ] && is_own_repo "$LOGIN" "$owner"; then
       continue
     fi
+    if ! budget_remain >/dev/null; then
+      budget_fail_pulls "$pr_done" "$pr_total"
+    fi
     if [ "$set_tag" = mine ]; then
       repo_name=${repo#*/}
       gh_graphql "$MINE_PR_QUERY" "$owner" "$repo_name" "$number" "$TMPDIR_RUN/gql-mine-$number.json"
+      pr_done=$((pr_done + 1))
       gql="$TMPDIR_RUN/gql-mine-$number.json"
       private=$(jq -r '.data.repository.isPrivate // false' "$gql")
       if [ "$private" = true ] || is_excluded "$repo" "$owner"; then
@@ -325,6 +356,7 @@ collect_inventory() {
       continue
     fi
     gh_get "repos/$repo/pulls/$number" "$TMPDIR_RUN/pull-$set_tag-$number.json"
+    pr_done=$((pr_done + 1))
     pull="$TMPDIR_RUN/pull-$set_tag-$number.json"
     private=$(jq -r '.base.repo.private // false' "$pull")
     if [ "$private" = true ] || is_excluded "$repo" "$owner"; then

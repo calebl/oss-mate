@@ -7,6 +7,15 @@ PASS=0
 fail() { printf 'not ok - %s\n' "$*"; exit 1; }
 ok() { PASS=$((PASS + 1)); printf 'ok %s - %s\n' "$PASS" "$*"; }
 mkdir -p "$TMP/fakebin" "$TMP/responses" "$TMP/state"
+cat > "$TMP/fakebin/date" <<'DATE'
+#!/usr/bin/env bash
+if [ "$1" = +%s ] && [ -f "${FAKE_DATE_FILE:-}" ]; then
+  cat "$FAKE_DATE_FILE"
+  exit 0
+fi
+exec /bin/date "$@"
+DATE
+chmod +x "$TMP/fakebin/date"
 cat > "$TMP/fakebin/gh" <<'FAKE'
 #!/usr/bin/env bash
 set -eu
@@ -31,7 +40,21 @@ is_graphql=0
 for arg in "${ARGS[@]}"; do
   [ "$arg" = graphql ] && is_graphql=1
 done
+fake_pr_fetch_count() {
+  count=$(cat "${FAKE_PR_FETCHES_FILE:-/dev/null}" 2>/dev/null || printf '0')
+  count=$((count + 1))
+  printf '%s' "$count" > "${FAKE_PR_FETCHES_FILE:?}"
+  printf '%s' "$count"
+}
 if [ "$is_graphql" -eq 1 ]; then
+  FAKE_PR_FETCHES=$(fake_pr_fetch_count)
+  if [ -n "${FAKE_DATE_FILE:-}" ]; then
+    now=$(cat "$FAKE_DATE_FILE")
+    now=$((now + ${FAKE_DATE_STEP:-1}))
+    printf '%s' "$now" > "$FAKE_DATE_FILE"
+  elif [ "${FAKE_SLOW:-0}" -gt 0 ] && [ "$FAKE_PR_FETCHES" -ge "${FAKE_SLOW_FROM:-1}" ]; then
+    sleep "$FAKE_SLOW"
+  fi
   owner= name= number=
   i=0
   while [ "$i" -lt "${#ORIG[@]}" ]; do
@@ -82,6 +105,14 @@ case "$ENDPOINT" in
     ;;
 esac
 if [[ "$ENDPOINT" =~ ^repos/[^/]+/[^/]+/pulls/[0-9]+$ ]]; then
+  FAKE_PR_FETCHES=$(fake_pr_fetch_count)
+  if [ -n "${FAKE_DATE_FILE:-}" ]; then
+    now=$(cat "$FAKE_DATE_FILE")
+    now=$((now + ${FAKE_DATE_STEP:-1}))
+    printf '%s' "$now" > "$FAKE_DATE_FILE"
+  elif [ "${FAKE_SLOW:-0}" -gt 0 ] && [ "$FAKE_PR_FETCHES" -ge "${FAKE_SLOW_FROM:-1}" ]; then
+    sleep "$FAKE_SLOW"
+  fi
   repo=${ENDPOINT#repos/}
   repo=${repo%/pulls/*}
   num=${ENDPOINT##*/}
@@ -97,6 +128,7 @@ chmod +x "$TMP/fakebin/gh"
 export PATH="$TMP/fakebin:$PATH"
 export OSS_MATE_MIN_POLL_SECONDS=60
 export FAKE_LOG="$TMP/log" FAKE_MUTATIONS="$TMP/mutations" FAKE_LOGIN=me FAKE_RESPONSES="$TMP/responses"
+export FAKE_PR_FETCHES_FILE="$TMP/pr-fetches" FAKE_DATE_FILE="$TMP/fake-date"
 SCRIPT="$ROOT/bin/github-open-prs"
 
 search_item() {
@@ -120,11 +152,13 @@ gql_fixture() {
 search_page() { jq -s --argjson total "$1" '{total_count:$total,items:.}'; }
 
 reset_case() {
-  rm -f "$TMP/log" "$TMP/mutations"
+  rm -f "$TMP/log" "$TMP/mutations" "$TMP/pr-fetches" "$TMP/fake-date"
   rm -rf "$TMP/state"
   mkdir -p "$TMP/state"
   : > "$TMP/log"
   : > "$TMP/mutations"
+  : > "$TMP/pr-fetches"
+  printf '1000' > "$TMP/fake-date"
 }
 run_check() {
   OSS_MATE_NOW=$1 "$SCRIPT" --state-dir "$TMP/state" check
@@ -157,6 +191,40 @@ case "$out" in *'theirs private count=1'*) ;; *) fail "config exclusion count is
 case "$out" in *me/listed*|*LISTED*) fail "configured repository leaked: $out" ;; esac
 [ ! -s "$TMP/mutations" ] || fail 'list made a mutating API call'
 ok 'mine excludes own repositories, lists external open pull requests, and keeps private counts'
+
+reset_case
+{
+  search_item 10 public/otherproj me 'My public PR'
+} | search_page 1 > "$TMP/responses/search-mine.json"
+printf '{"total_count":0,"items":[]}\n' > "$TMP/responses/search-theirs.json"
+gql_fixture 10 'My public PR' '2025-01-01T00:00:00Z' CONFLICTING > "$TMP/responses/gql-public-otherproj-10.json"
+"$SCRIPT" list >/dev/null
+search_path=$(grep -o '/search/issues[^ ]*' "$TMP/log" | head -1)
+[ -n "$search_path" ] || fail 'list did not call search/issues'
+case "$search_path" in *%2B*) fail "search path encodes + as %2B: $search_path" ;; esac
+case "$search_path" in
+  *%20is%3Aopen*|*' is:open'*) ;;
+  *) fail "search qualifiers are not space-separated: $search_path" ;;
+esac
+ok 'search query encodes space-separated qualifiers without literal plus signs'
+
+reset_case
+{
+  search_item 30 public/otherproj me 'Mergeable mine'
+  search_item 31 public/otherproj me 'Stale mine'
+  search_item 32 public/otherproj me 'Unknown mine'
+} | search_page 3 > "$TMP/responses/search-mine.json"
+printf '{"total_count":0,"items":[]}\n' > "$TMP/responses/search-theirs.json"
+gql_fixture 30 'Mergeable mine' '2025-01-01T00:00:00Z' MERGEABLE > "$TMP/responses/gql-public-otherproj-30.json"
+gql_fixture 31 'Stale mine' '2025-01-01T00:00:00Z' CONFLICTING > "$TMP/responses/gql-public-otherproj-31.json"
+gql_fixture 32 'Unknown mine' '2025-01-01T00:00:00Z' UNKNOWN > "$TMP/responses/gql-public-otherproj-32.json"
+export FAKE_DATE_STEP=1
+if OSS_MATE_CHECK_BUDGET=2 "$SCRIPT" list 2>"$TMP/err"; then fail 'budget exhaustion did not exit nonzero'; fi
+grep -q 'budget exhausted after 2 of 3 pull requests' "$TMP/err" \
+  || fail "budget exhaustion message is wrong: $(cat "$TMP/err")"
+grep -q 'invalid time interval' "$TMP/err" && fail 'budget exhaustion invoked timeout with empty interval'
+unset FAKE_DATE_STEP
+ok 'budget exhaustion exits cleanly with progress and without empty timeout'
 
 reset_case
 {
