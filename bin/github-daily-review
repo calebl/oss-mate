@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# github-daily-review - one read-only daily GitHub review in three sets.
+#
+# Usage:
+#   github-daily-review [options] check
+#   github-daily-review [options] pending
+#   github-daily-review [options] show
+#   github-daily-review [options] ack
+#   github-daily-review [options] mark-read [--yes] [thread-id ...]
+#   github-daily-review [options] close [--yes] owner/repo#N [...]
+#   github-daily-review --help
+#
+# Options:
+#   --state-dir DIR   Store state in DIR (default: $OSS_MATE_STATE_DIR or
+#                     $XDG_STATE_HOME/oss-mate, falling back to ~/.local/state/oss-mate).
+#   --config FILE     Read owned-elsewhere JSON (default: $OSS_MATE_OWNED_CONFIG, then
+#                     DIR/oss-mate-owned.json, then DIR/github-notifications-owned.json).
+#   --budget SECONDS  Bound a run (default: $OSS_MATE_CHECK_BUDGET or 20; 1..25).
+#
+# Sets:
+#   new-issues  Issues opened in public repositories the authenticated user owns, since the last
+#               successfully reported review.
+#   new-prs     Pull requests opened by other authors in those repositories, since that same point.
+#   my-prs      Every open pull request the authenticated user authored in a public repository they
+#               do not own, stale or not.
+#
+# Private repositories and repositories listed in the owned-elsewhere config appear only as a
+# per-set count, never by name, number, or title.
+#
+# Boundary:
+#   New and changed are judged against the last SUCCESSFULLY REPORTED review, not the last poll.
+#   A review becomes successfully reported only when ack runs, so an interrupted or partially failed
+#   run leaves the previous pending review and the previous boundary intact.
+#   The first review looks back 24 hours, controlled by OSS_MATE_FIRST_RUN_LOOKBACK_SECONDS.
+#   Later notification polls overlap their own cursor by six hours and deduplicate on thread id
+#   plus updated_at, so a thread that arrives on a cursor boundary is never dropped.
+#   The notification poll never reaches back further than OSS_MATE_NOTIFICATION_LOOKBACK_SECONDS
+#   (default seven days), because it is only an arrival signal and the search inventories carry the
+#   durable boundary however far back that boundary reaches.
+#
+# Stale means the pull request is not mergeable into its repository default branch per GitHub's
+# mergeable field, never from age, inactivity, or commits-behind; unknown or computing is not stale.
+#
+# Checks poll at most once daily by default, controlled by OSS_MATE_MIN_POLL_SECONDS (default 86400).
+# Daily is enough because the goal is never losing track of a relevant thread, not real-time response.
+# GitHub's X-Poll-Interval is honored as an additional minimum.
+#
+# Evidence:
+#   GitHub search supplies the three inventories and the notifications endpoint supplies arrival
+#   signals for the two owned-repository sets.
+#   Items are deduplicated by repository plus number and notification threads by thread id, so an
+#   item present in both sources is reported once.
+#   Notifications whose reason is ci_activity advance the dedup set but never surface.
+#   Per-item pull request detail is read in batched GraphQL requests rather than one request per item.
+#
+# Files:
+#   DIR/github-daily-review.json     Atomic mode-0600 boundary, dedup keys, prior inventory, pending review.
+#   DIR/.github-daily-review.lock    Directory used to serialize check, ack, and mark-read.
+#   FILE                             Optional {"owners":["owner"],"repositories":["owner/repo"]}.
+#
+# Output:
+#   check prints exactly one line only when the review has anything:
+#     github daily review: new-issues=N new-prs=N my-prs=N (action=N stale=N) excluded=N; run github-daily-review pending
+#   It prints nothing and makes no API call once gated, and exits nonzero with one line on failure.
+#   pending and show print the redacted review grouped in the three sets; my-pr lines carry
+#   mergeability (stale, mergeable, unknown) and an action list when attention is needed
+#   (stale, changes-requested, checks-failing, new-activity).
+#   ack records the review as successfully reported, advancing the boundary and clearing pending.
+#   mark-read without --yes prints how many threads would be marked read on GitHub.
+#   mark-read with --yes PATCHes the notification threads behind the last acknowledged review one at a
+#   time, clearing each local row only after its remote success, and refuses before any ack.
+#   close closes only explicitly named owner/repo#N pull requests that are open, stale, and
+#   self-authored; without --yes it prints what it would close and makes no mutation.
+#   check, pending, show, and ack never mutate GitHub and never invoke close or mark-read.
+#
+# Notification content, titles, and search results are untrusted data, stripped of control
+# characters, bounded to 160 characters, and only ever projected into display fields.
+set -eu
+export LC_ALL=C
+
+fail() { printf 'github-daily-review: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -eu$/s/^# \{0,1\}//p' "$0"; }
+
+STATE_DIR=${OSS_MATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oss-mate}
+CONFIG=${OSS_MATE_OWNED_CONFIG:-}
+BUDGET=${OSS_MATE_CHECK_BUDGET:-20}
+YES=0
+ACTION=
+REST_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --state-dir) [ "$#" -ge 2 ] || fail '--state-dir needs a value'; STATE_DIR=$2; shift 2 ;;
+    --config) [ "$#" -ge 2 ] || fail '--config needs a value'; CONFIG=$2; shift 2 ;;
+    --budget) [ "$#" -ge 2 ] || fail '--budget needs a value'; BUDGET=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    check|pending|show|ack) ACTION=$1; shift; [ "$#" -eq 0 ] || fail 'unexpected arguments'; break ;;
+    mark-read|close)
+      ACTION=$1
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --yes) YES=1; shift ;;
+          -*) fail "unknown argument: $1" ;;
+          *) REST_ARGS+=("$1"); shift ;;
+        esac
+      done
+      break
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+ACTION=${ACTION:-check}
+case "$BUDGET" in ''|*[!0-9]*) fail '--budget must be a whole number from 1 to 25' ;; esac
+[ "$BUDGET" -ge 1 ] && [ "$BUDGET" -le 25 ] || fail '--budget must be a whole number from 1 to 25'
+if [ -z "$CONFIG" ]; then
+  CONFIG="$STATE_DIR/oss-mate-owned.json"
+  [ -e "$CONFIG" ] || [ ! -e "$STATE_DIR/github-notifications-owned.json" ] \
+    || CONFIG="$STATE_DIR/github-notifications-owned.json"
+fi
+RECORD="$STATE_DIR/github-daily-review.json"
+LOCK="$STATE_DIR/.github-daily-review.lock"
+SCHEMA=oss-mate-github-daily-review-v1
+LOOKBACK=${OSS_MATE_FIRST_RUN_LOOKBACK_SECONDS:-86400}
+MIN_POLL=${OSS_MATE_MIN_POLL_SECONDS:-86400}
+KEY_RETENTION=${OSS_MATE_REPORTED_KEY_RETENTION_SECONDS:-2592000}
+OVERLAP=${OSS_MATE_CURSOR_OVERLAP_SECONDS:-21600}
+NOTIFY_LOOKBACK=${OSS_MATE_NOTIFICATION_LOOKBACK_SECONDS:-604800}
+NOW=${OSS_MATE_NOW:-$(date +%s)}
+NODE_CHUNK=${OSS_MATE_NODE_CHUNK:-30}
+case "$NOW:$LOOKBACK:$MIN_POLL:$KEY_RETENTION:$OVERLAP:$NOTIFY_LOOKBACK:$NODE_CHUNK" in
+  *[!0-9:]*) fail 'time and chunk settings must be whole numbers' ;;
+esac
+[ "$NODE_CHUNK" -ge 1 ] && [ "$NODE_CHUNK" -le 50 ] || fail 'OSS_MATE_NODE_CHUNK must be from 1 to 50'
+command -v jq >/dev/null 2>&1 || fail 'jq is required'
+command -v gh >/dev/null 2>&1 || fail 'gh is required'
+
+JQ_COMMON='
+  def sane: tostring | gsub("[\u0000-\u001f\u007f]"; " ");
+  def bounded: sane | .[0:160];
+  def pr_key: .repo + "#" + (.number|tostring);
+  def is_excluded($cfg; $repo; $owner):
+    any(($cfg.owners // [])[]; ascii_downcase == ($owner|ascii_downcase)) or
+    any(($cfg.repositories // [])[]; ascii_downcase == ($repo|ascii_downcase));
+  def actions:
+    [ (if .mergeability == "stale" then "stale" else empty end),
+      (if .changes_requested then "changes-requested" else empty end),
+      (if .checks_failing then "checks-failing" else empty end),
+      (if .new_activity then "new-activity" else empty end) ];
+'
+
+empty_state() {
+  jq -n --arg schema "$SCHEMA" '{
+    schema:$schema, next_poll:0, login:null, reported_at:null,
+    notification_since:null, notification_seen:[], reported_keys:{}, prior_prs:{},
+    acked_threads:[], pending:null
+  }'
+}
+validate_state() {
+  jq -e --arg schema "$SCHEMA" '
+    .schema == $schema and (.next_poll|type)=="number" and
+    (.login == null or (.login|type)=="string") and
+    (.reported_at == null or (.reported_at|type)=="string") and
+    (.notification_since == null or (.notification_since|type)=="string") and
+    (.notification_seen|type)=="array" and all(.notification_seen[]; type=="string") and
+    (.reported_keys|type)=="object" and (.prior_prs|type)=="object" and
+    (.acked_threads|type)=="array" and all(.acked_threads[]; type=="string") and
+    (.pending == null or ((.pending|type)=="object" and
+      (.pending.new_issues|type)=="array" and (.pending.new_prs|type)=="array" and
+      (.pending.my_prs|type)=="array" and (.pending.excluded|type)=="object" and
+      (.pending.threads|type)=="array" and (.pending.collected_at|type)=="string"))
+  ' "$1" >/dev/null 2>&1
+}
+validate_config() {
+  [ -e "$CONFIG" ] || return 0
+  [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail 'owned-elsewhere config must be a regular file'
+  jq -e 'type=="object" and ((.owners // [])|type)=="array" and
+    ((.repositories // [])|type)=="array" and
+    all((.owners // [])[]; type=="string" and length>0) and
+    all((.repositories // [])[]; type=="string" and test("^[^/]+/[^/]+$"))' "$CONFIG" >/dev/null 2>&1 \
+    || fail 'owned-elsewhere config is invalid'
+}
+load_state() {
+  if [ -f "$RECORD" ]; then
+    validate_state "$RECORD" || fail 'state file is invalid'
+    cat "$RECORD"
+  else
+    empty_state
+  fi
+}
+publish_state() {
+  chmod 600 "$1"
+  mv -f -- "$1" "$RECORD"
+}
+
+show_pending() {
+  [ -f "$RECORD" ] || exit 0
+  validate_state "$RECORD" || fail 'state file is invalid'
+  jq -r "$JQ_COMMON"'
+    .pending // empty |
+    ( .new_issues[] |
+      "new-issue repository=\(.repo) number=\(.number) author=\(.author) created=\(.created_at) title=\(.title|@json)" ),
+    ( select(.excluded.new_issues > 0) | "new-issues excluded count=\(.excluded.new_issues)" ),
+    ( .new_prs[] |
+      "new-pr repository=\(.repo) number=\(.number) author=\(.author) created=\(.created_at) title=\(.title|@json)" ),
+    ( select(.excluded.new_prs > 0) | "new-prs excluded count=\(.excluded.new_prs)" ),
+    ( .my_prs[] | (actions) as $a |
+      (if ($a|length) == 0 then "" else " action=" + ($a|join(",")) end) as $suffix |
+      "my-pr repository=\(.repo) number=\(.number) mergeability=\(.mergeability)\($suffix) title=\(.title|@json)" ),
+    ( select(.excluded.my_prs > 0) | "my-prs excluded count=\(.excluded.my_prs)" )
+  ' "$RECORD"
+}
+
+if [ "$ACTION" = pending ] || [ "$ACTION" = show ]; then show_pending; exit 0; fi
+
+validate_config
+
+DEADLINE=$(( $(date +%s) + BUDGET ))
+budget_remain() {
+  local remain=$((DEADLINE - $(date +%s)))
+  [ "$remain" -gt 0 ] || return 1
+  printf '%s' "$remain"
+}
+gh_get() {
+  local remain
+  remain=$(budget_remain) || fail 'budget exhausted'
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET "$1" > "$2" \
+    || fail "GitHub read failed or exceeded its budget for $1"
+}
+gh_graphql() {
+  local remain
+  remain=$(budget_remain) || fail 'budget exhausted'
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api graphql -f query="$1" > "$2" \
+    || fail 'GitHub GraphQL read failed or exceeded its budget'
+}
+gh_patch_state() {
+  local remain
+  remain=$(budget_remain) || fail 'budget exhausted'
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "$1" -f state=closed > "$2" \
+    || fail "GitHub close failed for $1"
+}
+
+mergeability_verdict() {
+  jq -r 'if .mergeable == true then "mergeable"
+         elif .mergeable == false then "stale"
+         else "unknown" end'
+}
+parse_ref() {
+  case "$1" in
+    */*#[0-9]*) ;;
+    *) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;;
+  esac
+  REF_REPO=${1%#*}
+  REF_NUM=${1##*#}
+  case "$REF_REPO" in */*) ;; *) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;; esac
+  case "$REF_NUM" in *[!0-9]*) fail "invalid pull request reference: $1 (expected owner/repo#number)" ;; esac
+}
+
+NODE_LIGHT_QUERY='query { nodes(ids: [@IDS@]) { __typename
+  ... on Issue { id number title createdAt updatedAt author { login } repository { nameWithOwner isPrivate owner { login } } }
+  ... on PullRequest { id number title createdAt updatedAt author { login } repository { nameWithOwner isPrivate owner { login } } }
+} }'
+NODE_RICH_QUERY='query { nodes(ids: [@IDS@]) { __typename
+  ... on PullRequest { id number title createdAt updatedAt mergeable reviewDecision
+    author { login } repository { nameWithOwner isPrivate owner { login } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }
+} }'
+
+NODE_PAGE=0
+fetch_node_chunk() {
+  local template=$1 out=$2
+  shift 2
+  local ids='' id response
+  for id in "$@"; do
+    if [ -z "$ids" ]; then ids="\"$id\""; else ids="$ids,\"$id\""; fi
+  done
+  NODE_PAGE=$((NODE_PAGE + 1))
+  response="$TMPDIR_RUN/nodes-$NODE_PAGE.json"
+  gh_graphql "${template//@IDS@/$ids}" "$response"
+  jq -e '.data.nodes | type == "array"' "$response" >/dev/null 2>&1 \
+    || fail 'GitHub returned an invalid GraphQL node page'
+  jq -c '.data.nodes[] | select(. != null)' "$response" >> "$out"
+}
+fetch_nodes() {
+  local template=$1 idfile=$2 out=$3
+  local -a chunk=()
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    case "$id" in *[!A-Za-z0-9_=+/:.-]*) fail 'GitHub returned an invalid node id' ;; esac
+    chunk+=("$id")
+    if [ "${#chunk[@]}" -ge "$NODE_CHUNK" ]; then
+      fetch_node_chunk "$template" "$out" "${chunk[@]}"
+      chunk=()
+    fi
+  done < "$idfile"
+  [ "${#chunk[@]}" -eq 0 ] || fetch_node_chunk "$template" "$out" "${chunk[@]}"
+}
+
+search_collect() {
+  local query=$1 outfile=$2 page=0 total count
+  : > "$TMPDIR_RUN/$outfile.jsonl"
+  while :; do
+    page=$((page + 1))
+    [ "$page" -le 10 ] || fail "search pagination exceeded 10 pages for $outfile"
+    gh_get "/search/issues?q=$(printf '%s' "$query" | jq -sRr @uri)&per_page=100&page=$page" \
+      "$TMPDIR_RUN/search-$outfile-$page.json"
+    jq -e '.items | type == "array"' "$TMPDIR_RUN/search-$outfile-$page.json" >/dev/null 2>&1 \
+      || fail "GitHub returned an invalid search page for $outfile"
+    jq -c '.items[]' "$TMPDIR_RUN/search-$outfile-$page.json" >> "$TMPDIR_RUN/$outfile.jsonl"
+    total=$(jq -r '.total_count // 0' "$TMPDIR_RUN/search-$outfile-$page.json")
+    count=$(jq -s 'length' "$TMPDIR_RUN/$outfile.jsonl")
+    [ "$count" -lt "$total" ] && [ "$(jq '.items | length' "$TMPDIR_RUN/search-$outfile-$page.json")" -eq 100 ] || break
+  done
+  jq -sc --arg set "$outfile" '
+    def repo_name: sub("^https://api.github.com/repos/"; "");
+    [ .[] | select((.number|type)=="number" and (.node_id|type)=="string") |
+      ((.repository_url // "") | repo_name) as $repo |
+      {set:$set, repo:$repo, owner:(($repo | split("/"))[0] // ""), number:.number, node_id:.node_id} ]
+  ' "$TMPDIR_RUN/$outfile.jsonl" > "$TMPDIR_RUN/$outfile-items.json"
+}
+
+poll_notifications() {
+  local since=$1 url page=0 response body remain header_poll
+  url="/notifications?all=true&per_page=100&since=$since"
+  : > "$TMPDIR_RUN/notifications.jsonl"
+  POLL_INTERVAL=60
+  while [ -n "$url" ]; do
+    page=$((page + 1))
+    [ "$page" -le 20 ] || fail 'notification pagination exceeded 20 pages'
+    remain=$(budget_remain) || fail 'budget exhausted'
+    response="$TMPDIR_RUN/notification-response.$page"
+    timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api -i --method GET "$url" > "$response" \
+      || fail 'GitHub notification read failed or exceeded its budget'
+    body="$TMPDIR_RUN/notification-body.$page.json"
+    awk 'found {print} /^\r?$/ {found=1}' "$response" > "$body"
+    jq -e 'type=="array"' "$body" >/dev/null 2>&1 || fail 'GitHub returned an invalid notification page'
+    jq -c '.[]' "$body" >> "$TMPDIR_RUN/notifications.jsonl"
+    header_poll=$(awk 'BEGIN{IGNORECASE=1} /^X-Poll-Interval:/ {sub(/\r$/,""); sub(/^[^:]*:[ ]*/,""); print; exit}' "$response")
+    case "$header_poll" in
+      ''|*[!0-9]*) ;;
+      *) [ "$header_poll" -le "$POLL_INTERVAL" ] || POLL_INTERVAL=$header_poll ;;
+    esac
+    url=$(awk 'BEGIN{IGNORECASE=1} /^Link:/ && /rel="next"/ {
+      line=$0; n=split(line,a,","); for(i=1;i<=n;i++) if(a[i]~/rel="next"/) {sub(/^.*</,"",a[i]); sub(/>.*/,"",a[i]); sub(/^https:\/\/api.github.com/,"",a[i]); print a[i]}}
+    ' "$response")
+  done
+  jq -sc '.' "$TMPDIR_RUN/notifications.jsonl" > "$TMPDIR_RUN/notifications.json"
+}
+
+collect_review() {
+  if [ -e "$CONFIG" ]; then
+    cp "$CONFIG" "$TMPDIR_RUN/config.json"
+  else
+    printf '{"owners":[],"repositories":[]}\n' > "$TMPDIR_RUN/config.json"
+  fi
+  gh_get user "$TMPDIR_RUN/user.json"
+  LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+    || fail 'authenticated-user lookup returned an invalid login'
+  local reported_at
+  reported_at=$(jq -r '.reported_at // ""' "$TMPDIR_RUN/old.json")
+  if [ -n "$reported_at" ]; then
+    BOUNDARY=$reported_at
+  else
+    BOUNDARY=$(date -u -d "@$((NOW > LOOKBACK ? NOW - LOOKBACK : 0))" +%Y-%m-%dT%H:%M:%SZ)
+  fi
+  search_collect "is:issue user:${LOGIN} created:>=${BOUNDARY}" new_issues
+  search_collect "is:pr user:${LOGIN} -author:${LOGIN} created:>=${BOUNDARY}" new_prs
+  search_collect "is:pr is:open author:${LOGIN} -user:${LOGIN}" my_prs
+
+  local notify_since notify_epoch notify_floor
+  notify_since=$(jq -r '.notification_since // ""' "$TMPDIR_RUN/old.json")
+  if [ -n "$notify_since" ]; then
+    notify_epoch=$(date -u -d "$notify_since" +%s 2>/dev/null) || fail 'stored notification cursor is invalid'
+    notify_epoch=$((notify_epoch > OVERLAP ? notify_epoch - OVERLAP : 0))
+  else
+    notify_epoch=$(date -u -d "$BOUNDARY" +%s 2>/dev/null) || fail 'review boundary is invalid'
+  fi
+  # Notifications are only an arrival signal; the durable boundary lives in the search inventories,
+  # so this poll stays inside its own window however far back the review boundary reaches.
+  notify_floor=$((NOW > NOTIFY_LOOKBACK ? NOW - NOTIFY_LOOKBACK : 0))
+  [ "$notify_epoch" -ge "$notify_floor" ] || notify_epoch=$notify_floor
+  poll_notifications "$(date -u -d "@$notify_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+  jq -n "$JQ_COMMON"'
+    def relevant($n; $login):
+      ($n.reason | IN("assign","author","comment","invitation","mention","review_requested",
+                      "security_alert","state_change","team_mention")) or
+      (($n.reason | IN("subscribed","manual")) and
+        ((($n.repository.owner.login // "") | ascii_downcase) == ($login | ascii_downcase)) and
+        ($n.subject.type | IN("PullRequest","Issue")));
+    $old[0] as $o | $rows[0] as $all | $cfg[0] as $cfg |
+    [ $all[] | select((.id|type)=="string" and (.updated_at|type)=="string") |
+      . + {_key:(.id + "@" + .updated_at)} | . as $n |
+      select(($o.notification_seen | index($n._key)) == null) ] as $fresh |
+    [ $fresh[] | select(.reason != "ci_activity") | select(relevant(.; $login)) ] as $rel |
+    {
+      keys: ([ $fresh[]._key ] | unique),
+      threads: ([ $rel[] | .id | sane ] | unique),
+      candidates: ([ $rel[] |
+        select((.subject.type // "") | IN("Issue","PullRequest")) |
+        select((((.repository.owner.login // "") | ascii_downcase)) == ($login | ascii_downcase)) |
+        select(.repository.private == false) |
+        select(is_excluded($cfg; (.repository.full_name // ""); (.repository.owner.login // "")) | not) |
+        { set: (if .subject.type == "Issue" then "new_issues" else "new_prs" end),
+          repo: ((.repository.full_name // "") | sane),
+          number: ((((.subject.url // "") | [scan("[0-9]+$")])[0]) // null) } |
+        select(.number != null and (.repo | test("^[^/]+/[^/]+$"))) |
+        .number |= tonumber ] | unique)
+    }' --slurpfile old "$TMPDIR_RUN/old.json" --slurpfile rows "$TMPDIR_RUN/notifications.json" \
+       --slurpfile cfg "$TMPDIR_RUN/config.json" --arg login "$LOGIN" > "$TMPDIR_RUN/notification-facts.json"
+
+  jq -sc 'add' "$TMPDIR_RUN/new_issues-items.json" "$TMPDIR_RUN/new_prs-items.json" \
+    "$TMPDIR_RUN/my_prs-items.json" > "$TMPDIR_RUN/items.json"
+  jq -r '.[] | select(.set != "my_prs") | .node_id' "$TMPDIR_RUN/items.json" > "$TMPDIR_RUN/light-ids"
+  jq -r '.[] | select(.set == "my_prs") | .node_id' "$TMPDIR_RUN/items.json" > "$TMPDIR_RUN/rich-ids"
+  : > "$TMPDIR_RUN/nodes.jsonl"
+  fetch_nodes "$NODE_LIGHT_QUERY" "$TMPDIR_RUN/light-ids" "$TMPDIR_RUN/nodes.jsonl"
+  fetch_nodes "$NODE_RICH_QUERY" "$TMPDIR_RUN/rich-ids" "$TMPDIR_RUN/nodes.jsonl"
+  jq -sc '.' "$TMPDIR_RUN/nodes.jsonl" > "$TMPDIR_RUN/nodes.json"
+
+  # Notification candidates the search inventories did not already carry are resolved once each, so an
+  # item present in both sources is still reported exactly once.
+  jq -r --slurpfile items "$TMPDIR_RUN/items.json" '
+    ([ $items[0][] | .repo + "#" + (.number|tostring) ]) as $known |
+    .candidates[] | . as $c | select(($known | index($c.repo + "#" + ($c.number|tostring))) == null) |
+    "\(.set) \(.repo) \(.number)"' "$TMPDIR_RUN/notification-facts.json" > "$TMPDIR_RUN/unmatched"
+  : > "$TMPDIR_RUN/extras.jsonl"
+  local cand_set cand_repo cand_number
+  while read -r cand_set cand_repo cand_number; do
+    [ -n "${cand_number:-}" ] || continue
+    gh_get "repos/$cand_repo/issues/$cand_number" "$TMPDIR_RUN/resolved-$cand_number.json"
+    jq -c --arg set "$cand_set" --arg repo "$cand_repo" --argjson number "$cand_number" \
+      "$JQ_COMMON"'
+      select((.created_at|type)=="string") |
+      {set:$set, repo:$repo, owner:(($repo|split("/"))[0]), number:$number,
+       title:(.title|bounded), created_at:.created_at, updated_at:(.updated_at // .created_at),
+       author_login:((.user.login // "") | sane), private:false, mergeability:"unknown",
+       changes_requested:false, checks_failing:false}' \
+      "$TMPDIR_RUN/resolved-$cand_number.json" >> "$TMPDIR_RUN/extras.jsonl"
+  done < "$TMPDIR_RUN/unmatched"
+  jq -sc '.' "$TMPDIR_RUN/extras.jsonl" > "$TMPDIR_RUN/extras.json"
+
+  COLLECTED_AT=$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)
+  jq -n "$JQ_COMMON"'
+    def verdict: if . == "MERGEABLE" then "mergeable" elif . == "CONFLICTING" then "stale" else "unknown" end;
+    def hidden($cfg): .private or is_excluded($cfg; .repo; .owner);
+    def author_tag($login): if (.author_login|ascii_downcase) == ($login|ascii_downcase) then "self" else "other" end;
+    $old[0] as $o | $cfg[0] as $cfg |
+    ([ $nodes[0][] | {key:.id, value:.} ] | from_entries) as $nmap |
+    ($o.reported_at // "") as $rep |
+    [ $items[0][] | . as $it | ($nmap[$it.node_id] // null) as $n | select($n != null) |
+      { set:$it.set,
+        repo:(($n.repository.nameWithOwner // $it.repo) | sane),
+        owner:(($n.repository.owner.login // $it.owner) | sane),
+        number:$n.number,
+        title:($n.title | bounded),
+        created_at:($n.createdAt // ""),
+        updated_at:($n.updatedAt // ""),
+        private:($n.repository.isPrivate == true),
+        author_login:(($n.author.login // "") | sane),
+        mergeability:(($n.mergeable // "") | verdict),
+        changes_requested:($n.reviewDecision == "CHANGES_REQUESTED"),
+        checks_failing:(((([ $n.commits.nodes[]? | .commit.statusCheckRollup.state ])[0]) // "")
+                        | (. == "FAILURE" or . == "ERROR")) } ] as $rows |
+    ([ $rows[] | pr_key ]) as $rowkeys |
+    ([ $extras[0][] | . as $e | select(($rowkeys | index($e|pr_key)) == null) ]) as $extra_rows |
+    ($rows + $extra_rows) as $all |
+    ([ $all[] | select(.set == "new_issues") |
+       select(.created_at > $bound) |
+       select(($o.reported_keys[pr_key] // null) == null) ]) as $issues |
+    ([ $all[] | select(.set == "new_prs") |
+       select((.author_login|ascii_downcase) != ($login|ascii_downcase)) |
+       select(.created_at > $bound) |
+       select(($o.reported_keys[pr_key] // null) == null) ]) as $prs |
+    ([ $all[] | select(.set == "my_prs") |
+       select((.owner|ascii_downcase) != ($login|ascii_downcase)) ]) as $mine |
+    ([ $issues[] | select(hidden($cfg) | not) |
+       {repo, number, author:author_tag($login), created_at, title} ]) as $issues_out |
+    ([ $prs[] | select(hidden($cfg) | not) |
+       {repo, number, author:author_tag($login), created_at, title} ]) as $prs_out |
+    ([ $mine[] | select(hidden($cfg) | not) | . as $r |
+       {repo, number, mergeability, updated_at, changes_requested, checks_failing,
+        new_activity: (($o.prior_prs[$r|pr_key] // null) as $p |
+          if $p != null then ($r.updated_at > ($p.updated_at // ""))
+          elif $rep != "" then ($r.updated_at > $rep)
+          else false end),
+        title} ]) as $mine_out |
+    {
+      collected_at: $collected,
+      new_issues: $issues_out,
+      new_prs: $prs_out,
+      my_prs: $mine_out,
+      excluded: {
+        new_issues: ([ $issues[] | select(hidden($cfg)) ] | length),
+        new_prs: ([ $prs[] | select(hidden($cfg)) ] | length),
+        my_prs: ([ $mine[] | select(hidden($cfg)) ] | length)
+      },
+      threads: ((($o.pending.threads // []) + $facts[0].threads) | unique),
+      created_at_by_key: ([ ($issues_out[], $prs_out[]) | {key: pr_key, value: .created_at} ] | from_entries),
+      prior_prs: ([ $mine_out[] | {key: pr_key, value: {mergeability, updated_at}} ] | from_entries)
+    }' --slurpfile old "$TMPDIR_RUN/old.json" --slurpfile cfg "$TMPDIR_RUN/config.json" \
+       --slurpfile items "$TMPDIR_RUN/items.json" --slurpfile nodes "$TMPDIR_RUN/nodes.json" \
+       --slurpfile extras "$TMPDIR_RUN/extras.json" --slurpfile facts "$TMPDIR_RUN/notification-facts.json" \
+       --arg login "$LOGIN" --arg bound "$BOUNDARY" --arg collected "$COLLECTED_AT" \
+    > "$TMPDIR_RUN/review.json"
+}
+
+if [ "$ACTION" = close ]; then
+  TMPDIR_RUN=$(mktemp -d "${TMPDIR:-/tmp}/github-daily-review.XXXXXX")
+  trap 'rm -rf -- "$TMPDIR_RUN"' EXIT HUP INT TERM
+  gh_get user "$TMPDIR_RUN/user.json"
+  LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+    || fail 'authenticated-user lookup returned an invalid login'
+  [ "${#REST_ARGS[@]}" -gt 0 ] || fail 'close requires at least one owner/repo#number argument'
+  TO_CLOSE=()
+  for ref in "${REST_ARGS[@]}"; do
+    parse_ref "$ref"
+    gh_get "repos/$REF_REPO/pulls/$REF_NUM" "$TMPDIR_RUN/close-$REF_NUM.json"
+    pr="$TMPDIR_RUN/close-$REF_NUM.json"
+    if [ "$(jq -r '.user.login // ""' "$pr" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$LOGIN" | tr '[:upper:]' '[:lower:]')" ]; then
+      fail "refusing close: $ref is not authored by the authenticated user (author=$(jq -r '.user.login // "unknown"' "$pr"))"
+    fi
+    if [ "$(jq -r '.state // ""' "$pr")" != open ]; then
+      fail "refusing close: $ref is not open (state=$(jq -r '.state // "unknown"' "$pr"))"
+    fi
+    verdict=$(mergeability_verdict < "$pr")
+    [ "$verdict" = stale ] || fail "refusing close: $ref is not stale (mergeability=$verdict)"
+    TO_CLOSE+=("$ref")
+  done
+  if [ "$YES" -eq 0 ]; then
+    printf 'would close:'
+    for ref in "${TO_CLOSE[@]}"; do printf ' %s' "$ref"; done
+    printf '\n'
+    exit 0
+  fi
+  for ref in "${TO_CLOSE[@]}"; do
+    parse_ref "$ref"
+    gh_patch_state "repos/$REF_REPO/pulls/$REF_NUM" "$TMPDIR_RUN/closed-$REF_NUM.json"
+  done
+  exit 0
+fi
+
+if [ "$ACTION" = mark-read ] && [ "$YES" -eq 0 ]; then
+  [ -f "$RECORD" ] || fail 'refusing mark-read: no review has been acknowledged yet'
+  validate_state "$RECORD" || fail 'state file is invalid'
+  [ -n "$(jq -r '.reported_at // ""' "$RECORD")" ] \
+    || fail 'refusing mark-read: no review has been acknowledged yet'
+  if [ "${#REST_ARGS[@]}" -eq 0 ]; then
+    COUNT=$(jq '.acked_threads | length' "$RECORD")
+  else
+    COUNT=${#REST_ARGS[@]}
+  fi
+  printf 'mark-read: would mark %s threads read on GitHub\n' "$COUNT"
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+if ! mkdir "$LOCK" 2>/dev/null; then
+  [ "$ACTION" = check ] && exit 0
+  fail 'another github-daily-review command holds the lock'
+fi
+TMPDIR_RUN=$(mktemp -d "$STATE_DIR/.github-daily-review.XXXXXX")
+trap 'rm -rf -- "$TMPDIR_RUN" "$LOCK"' EXIT HUP INT TERM
+load_state > "$TMPDIR_RUN/old.json"
+
+if [ "$ACTION" = ack ]; then
+  [ "$(jq -r '.pending != null' "$TMPDIR_RUN/old.json")" = true ] || exit 0
+  jq --argjson retain "$KEY_RETENTION" '
+    .pending as $p |
+    ((($p.collected_at | fromdateiso8601) - $retain) | todate) as $cutoff |
+    .reported_at = $p.collected_at |
+    .reported_keys = ((.reported_keys + ($p.created_at_by_key // {}))
+                      | with_entries(select(.value >= $cutoff))) |
+    .prior_prs = ($p.prior_prs // {}) |
+    .acked_threads = ((.acked_threads + ($p.threads // [])) | unique) |
+    .pending = null
+  ' "$TMPDIR_RUN/old.json" > "$TMPDIR_RUN/ack.json"
+  validate_state "$TMPDIR_RUN/ack.json" || fail 'refusing to publish an invalid acknowledgement'
+  publish_state "$TMPDIR_RUN/ack.json"
+  exit 0
+fi
+
+if [ "$ACTION" = mark-read ]; then
+  [ -n "$(jq -r '.reported_at // ""' "$TMPDIR_RUN/old.json")" ] \
+    || fail 'refusing mark-read: no review has been acknowledged yet'
+  IDS=()
+  if [ "${#REST_ARGS[@]}" -eq 0 ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      IDS+=("$id")
+    done < <(jq -r '.acked_threads[]' "$TMPDIR_RUN/old.json")
+  else
+    for id in "${REST_ARGS[@]}"; do
+      jq -e --arg id "$id" '((.acked_threads + (.pending.threads // [])) | index($id)) != null' \
+        "$TMPDIR_RUN/old.json" >/dev/null 2>&1 \
+        || fail "thread id is not in the acknowledged or pending review: $id"
+      IDS+=("$id")
+    done
+  fi
+  MARKED=0
+  for id in ${IDS[@]+"${IDS[@]}"}; do
+    if ! env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method PATCH "notifications/threads/$id" -f read=true >/dev/null; then
+      printf 'mark-read: marked=%s failed=1 remaining=%s\n' "$MARKED" "$(( ${#IDS[@]} - MARKED ))"
+      exit 1
+    fi
+    jq --arg id "$id" '
+      .acked_threads = [ .acked_threads[] | select(. != $id) ] |
+      if .pending == null then . else .pending.threads = [ .pending.threads[] | select(. != $id) ] end
+    ' "$RECORD" > "$TMPDIR_RUN/mark-read.json"
+    publish_state "$TMPDIR_RUN/mark-read.json"
+    MARKED=$((MARKED + 1))
+  done
+  printf 'mark-read: marked=%s failed=0 remaining=0\n' "$MARKED"
+  exit 0
+fi
+
+NEXT=$(jq -r .next_poll "$TMPDIR_RUN/old.json")
+[ "$NOW" -ge "$NEXT" ] || exit 0
+POLL_INTERVAL=60
+collect_review
+NEXT_INTERVAL=$POLL_INTERVAL
+[ "$MIN_POLL" -le "$NEXT_INTERVAL" ] || NEXT_INTERVAL=$MIN_POLL
+jq --arg login "$LOGIN" --arg since "$COLLECTED_AT" --argjson next "$((NOW + NEXT_INTERVAL))" \
+  --slurpfile review "$TMPDIR_RUN/review.json" --slurpfile facts "$TMPDIR_RUN/notification-facts.json" '
+  .login = $login | .next_poll = $next | .notification_since = $since |
+  .notification_seen = ((.notification_seen + $facts[0].keys) | unique) |
+  .pending = $review[0]
+' "$TMPDIR_RUN/old.json" > "$TMPDIR_RUN/publish.json"
+validate_state "$TMPDIR_RUN/publish.json" || fail 'refusing to publish an invalid review'
+SUMMARY=$(jq -r "$JQ_COMMON"'.pending |
+  [ (.new_issues|length), (.new_prs|length), (.my_prs|length),
+    ([ .my_prs[] | select((actions|length) > 0) ] | length),
+    ([ .my_prs[] | select(.mergeability == "stale") ] | length),
+    (.excluded.new_issues + .excluded.new_prs + .excluded.my_prs) ] | join(" ")' \
+  "$TMPDIR_RUN/publish.json")
+read -r NEW_ISSUES NEW_PRS MY_PRS MY_ACTION MY_STALE EXCLUDED <<SUMMARY_LINE
+$SUMMARY
+SUMMARY_LINE
+publish_state "$TMPDIR_RUN/publish.json"
+if [ "$((NEW_ISSUES + NEW_PRS + MY_PRS + EXCLUDED))" -gt 0 ]; then
+  printf 'github daily review: new-issues=%s new-prs=%s my-prs=%s (action=%s stale=%s) excluded=%s; run github-daily-review pending\n' \
+    "$NEW_ISSUES" "$NEW_PRS" "$MY_PRS" "$MY_ACTION" "$MY_STALE" "$EXCLUDED"
+fi

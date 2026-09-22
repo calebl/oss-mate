@@ -2,25 +2,58 @@
 
 This repository owns agent skills and small tools for monitoring and contributing to external open-source projects.
 
-## GitHub notification monitor
+## Daily GitHub review
 
-`bin/github-notifications` performs a bounded read-only poll of relevant notifications for the authenticated GitHub user.
-It uses the logged-in `gh` CLI, requests all notification threads, applies its narrow relevance filter locally, follows pagination, honors GitHub's `X-Poll-Interval`, and never marks notifications read or mutates a repository.
-Participating reasons surface comments on the user's pull requests in other open-source repositories and state changes when those pull requests merge.
-Subscribed or manual notifications surface a pull request or issue opened by someone else in a public repository owned by the authenticated user.
-Subscribed notifications from other watched repositories are excluded.
-The authenticated login is resolved read-only for this classification, cached with the cursor, and never printed.
-The first poll looks back 24 hours by default instead of loading full history.
-Later polls overlap the durable cursor by six hours and deduplicate on thread id plus `updated_at`.
-The script atomically stores its successful cursor, GitHub `Last-Modified` value, dedup keys, and redacted pending projection in `github-notifications.json` under its state directory.
-Notifications whose reason is `ci_activity` advance the cursor and dedup set but never appear in the check line, pending output, or durable pending projection.
+`bin/github-daily-review` is the single operator entry point.
+It performs one bounded read-only pass over GitHub and reports three sets:
+
+1. `new-issues` are issues opened in public repositories the authenticated user owns, since the last successfully reported review.
+2. `new-prs` are pull requests opened by other authors in those same repositories, since that same point.
+3. `my-prs` is every open pull request the authenticated user authored in a public repository they do not own.
+
+The third set is the whole inventory rather than a stale list, so a healthy pull request still appears.
+Each `my-pr` row carries a mergeability verdict of `stale`, `mergeable`, or `unknown`, and an `action` list only when it needs attention.
+The action values are `stale`, `changes-requested`, `checks-failing`, and `new-activity`, all derived read-only from GitHub data.
+`new-activity` means the pull request was updated since the last successfully reported review.
+Stale means the pull request is not mergeable into its repository default branch per GitHub's `mergeable` field, never from age, inactivity, or commits-behind.
+An unknown or still-computing mergeability is reported as `unknown` and is never treated as stale.
+
+The tool uses the logged-in `gh` CLI, resolves the authenticated login once per run, and never prints it.
+It manages no token of its own.
+
+### The boundary and the reporting handshake
+
+New and changed are judged against the last **successfully reported** review, not the last poll.
+
+- `check` is daily-gated, collects the review, and prints exactly one line when the review has anything.
+- `pending` (alias `show`) prints the redacted review grouped in the three sets; that output is the report.
+- `ack` records the review as successfully reported, which advances the boundary and clears pending.
+
+Until `ack` runs, a later `check` re-includes everything that was never reported, so an interruption loses no work.
+A partial API failure mid-collection leaves the previous pending review intact, prints one line, and exits nonzero.
+Nothing is written to the state file until a collection completes, so a failed or budget-exhausted run publishes nothing.
+
+```
+github daily review: new-issues=2 new-prs=3 my-prs=6 (action=2 stale=1) excluded=5; run github-daily-review pending
+```
+
+A single atomic mode-0600 `github-daily-review.json` under the state directory holds the last successfully reported review time, the prior inventory of the third set, the already-reported issue and pull request keys, the notification dedup keys, and the notification thread ids behind the current pending review.
 The default state directory is `$OSS_MATE_STATE_DIR`, then `$XDG_STATE_HOME/oss-mate`, then `~/.local/state/oss-mate`.
 The script header and `--help` are the authoritative interface reference.
 
-A relevant public notification is external by default.
-A relevant private notification is excluded and reported only as part of a count.
-An optional config file lists additional owners and repositories whose notifications are excluded and reported only as part of that count.
-The default config path is `github-notifications-owned.json` in the state directory, and `--config` or `$OSS_MATE_OWNED_CONFIG` can select another path.
+### Evidence and deduplication
+
+GitHub search supplies the three inventories and the notifications endpoint supplies arrival signals for the two owned-repository sets.
+Issues and pull requests are deduplicated by repository plus number, and notification threads by thread id, so an item present in both sources is reported once.
+Notifications whose reason is `ci_activity` advance the dedup set but never surface.
+Per-item pull request detail is read in batched GraphQL requests of roughly thirty nodes each rather than one request per pull request, so a full review completes well inside the default budget.
+Later notification polls overlap their stored cursor by six hours and never reach back further than seven days, because the durable boundary lives in the search inventories.
+
+### Redaction
+
+A public item is reported with its repository, number, author flag, timestamps, bounded title, and indicators.
+A private repository, or one listed in the optional owned-elsewhere config file, appears only as a per-set count.
+Its name, number, and title are neither printed nor persisted.
 
 ```json
 {
@@ -30,58 +63,44 @@ The default config path is `github-notifications-owned.json` in the state direct
 ```
 
 Owner and repository comparisons are case-insensitive.
-No notification body or comment text is fetched, printed, or persisted.
-Private and config-listed repository names and subject titles are neither printed nor persisted.
-Subject titles from public external repositories are untrusted display data, stripped of control characters, and limited to 160 characters.
+The default config path is `oss-mate-owned.json` in the state directory, falling back to `github-notifications-owned.json` there; `--config` or `$OSS_MATE_OWNED_CONFIG` selects another path.
+No issue body, pull request body, or comment text is fetched, printed, or persisted.
+Titles from public repositories are untrusted display data, stripped of control characters, and limited to 160 characters.
 
-## Open pull request monitor
+### The two explicit mutations
 
-`bin/github-open-prs` tracks open pull requests the authenticated user authored in repositories they do not own, and open pull requests from other authors in repositories the authenticated user owns.
-It uses the logged-in `gh` CLI, resolves the authenticated login once per run read-only, and never prints it.
-Stale means the pull request is not mergeable into its repository default branch per GitHub's mergeable field, never from age, inactivity, or commits-behind.
-The default `list` verb prints one redacted line per open public pull request with a set tag (`mine` or `theirs`), repository, number, author flag, mergeability verdict, and a bounded title.
-Private repositories and entries matched by the optional owned-elsewhere config file are reported only as a per-set count, never by name or title.
-The same config path convention as the notification monitor applies: default `github-notifications-owned.json` in the state directory, overridable with `--config` or `$OSS_MATE_OWNED_CONFIG`.
-Pass `--stale` to keep only pull requests whose mergeability verdict is stale on `list`; unknown or still-computing states are reported as unknown and are never treated as stale.
-The `check` verb performs the same two-set inventory read-only, compares it against a durable previous snapshot in `github-open-prs.json` under its state directory, and prints one summary line when there is anything to review.
-The `pending` and `show` verbs print every open public pull request with mergeability status for authored pull requests (`new-stale`, `still-stale`, `mergeable`, or `unknown`) and an `action` list when attention is needed (`stale`, `changes-requested`, `checks-failing`, or `new-activity`).
-Pull requests opened by others in owned repositories are flagged `new` when absent from the previous snapshot.
-The default state directory matches the notification monitor: `$OSS_MATE_STATE_DIR`, then `$XDG_STATE_HOME/oss-mate`, then `~/.local/state/oss-mate`.
-Checks poll at most once daily by default, controlled by `OSS_MATE_MIN_POLL_SECONDS` (default 86400).
-The `close` verb closes only explicitly named `owner/repo#number` pull requests that are open, stale, and self-authored; without `--yes` it prints the exact pull requests it would close and makes no mutation.
-`check`, `pending`, `show`, and `list` are read-only; `close` is the only mutation and has no bulk or `--all` form.
-The default budget is 20 seconds and can be changed with `--budget`.
-The script header and `--help` are the authoritative interface reference.
+`check`, `pending`, `show`, and `ack` are read-only and never invoke either of the following.
 
-## Running it periodically
+`mark-read [--yes] [thread-id ...]` marks read on GitHub only the notification threads behind the last acknowledged review.
+It refuses before any review has been acknowledged, so a summary that was never delivered is never dismissed.
+Without `--yes` it prints how many threads it would mark read and makes no GitHub call.
+With `--yes` it PATCHes one thread at a time and clears each local row only after that thread's remote success, so a failure stops with a one-line summary and a later run resumes the remainder.
+Optional thread ids narrow the set to the acknowledged or current pending review and never widen it.
 
-The `check` verb prints one line only when something new surfaced, so any scheduler or agent hook can run it.
+`close [--yes] owner/repo#N [...]` closes only explicitly named pull requests that are open, stale, and self-authored.
+Without `--yes` it prints exactly what it would close and makes no mutation.
+It has no bulk or `--all` form, and no read path ever calls it.
+
+## Running it daily
+
+The `check` verb prints one line only when there is something to review, so any scheduler or agent hook can run it.
 Daily is enough because the goal is never losing track of a relevant thread, not real-time response.
-The following cron entries run both checks once daily at 09:00 with explicit durable state and config paths.
-Both tools can be reviewed in the same daily pass; notification mark-read remains explicit and separate.
 
 ```cron
-0 9 * * * /absolute/path/to/oss-mate/bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" --config "$HOME/.config/oss-mate/github-notifications-owned.json" check
-0 9 * * * /absolute/path/to/oss-mate/bin/github-open-prs --state-dir "$HOME/.local/state/oss-mate" --config "$HOME/.config/oss-mate/github-notifications-owned.json" check
+0 9 * * * /absolute/path/to/oss-mate/bin/github-daily-review --state-dir "$HOME/.local/state/oss-mate" --config "$HOME/.config/oss-mate/oss-mate-owned.json" check
 ```
 
-Each script also enforces a daily minimum between API polls by default, so a more frequent caller stays silent without making an API call.
+The script also enforces a daily minimum between API polls by default, so a more frequent caller stays silent without making an API call.
 `OSS_MATE_MIN_POLL_SECONDS` overrides that minimum when a different cadence is deliberately required, while GitHub's `X-Poll-Interval` remains an additional floor.
 The default budget is 20 seconds and can be changed with `--budget` when the calling system has a different execution limit.
-Run `bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" pending` to inspect the redacted durable details after a nonempty notification check result.
-Run `bin/github-open-prs --state-dir "$HOME/.local/state/oss-mate" pending` after a nonempty open-pull-request check result.
-After the details have been classified and reported to the operator, run the same command with `ack` to clear the local pending projection while preserving the cursor and dedup set.
-`ack` does not mark anything read on GitHub.
-To mark the pending threads read on GitHub, run the same command with `mark-read --yes`.
-Without `--yes`, `mark-read` prints how many pending threads would be marked read and makes no GitHub mutation.
-`mark-read` processes pending threads one at a time, clears each local row only after its remote mark-read succeeds, and stops with a one-line summary if a remote call fails so a later run can resume the remainder.
-Optional thread ids after `mark-read` narrow the set but never widen it beyond the current pending projection.
-`check`, `pending`, `show`, and `ack` never mark a thread read on GitHub.
-The non-user-invocable skill at `skills/github-notification-triage/SKILL.md` owns the generic read-only classification and summary procedure.
-For non-mergeable pull requests the authenticated user opened, `bin/github-open-prs --stale list` and `close` are the supported read and explicit-close path.
+On budget exhaustion the run stops with one line and a nonzero exit, keeping the previous pending review intact.
+
+After a nonempty check line, run the same command with `pending`, report the review, and only then run `ack`.
+The non-user-invocable skill at `skills/github-daily-review/SKILL.md` owns the generic read-only classification and summary procedure.
+`mark-read --yes` and `close --yes` remain separate explicit steps the operator decides on after the summary.
 
 ## Development
 
-Run the executable behavior suite with `tests/github-notifications.test.sh` and `tests/github-open-prs.test.sh`.
+Run the executable behavior suite with `tests/github-daily-review.test.sh`.
 Run `shellcheck bin/*` before proposing changes.
 Pull requests and pushes to `main` run the same shellcheck and behavior-test suite in GitHub Actions.
