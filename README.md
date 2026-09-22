@@ -34,6 +34,20 @@ No notification body or comment text is fetched, printed, or persisted.
 Private and config-listed repository names and subject titles are neither printed nor persisted.
 Subject titles from public external repositories are untrusted display data, stripped of control characters, and limited to 160 characters.
 
+## Stale pull request monitor
+
+`bin/github-stale-prs` lists open pull requests authored by the authenticated user anywhere and pull requests opened by other people in repositories owned by the authenticated user.
+It uses the logged-in `gh` CLI, resolves the authenticated login once per run read-only, and never prints it.
+Stale means the pull request is not mergeable into its repository default branch per GitHub's mergeable field, never from age, inactivity, or commits-behind.
+The default `list` verb prints one redacted line per open public pull request with a set tag (`mine` or `theirs`), repository, number, author flag, mergeability verdict, and a bounded title.
+Private repositories and entries matched by the optional owned-elsewhere config file are reported only as a per-set count, never by name or title.
+The same config path convention as the notification monitor applies: default `github-notifications-owned.json` in the state directory, overridable with `--config` or `$OSS_MATE_OWNED_CONFIG`.
+Pass `--stale` to keep only pull requests whose mergeability verdict is stale; unknown or still-computing states are reported as unknown and are never treated as stale.
+The `close` verb closes only explicitly named `owner/repo#number` pull requests that are open, stale, and self-authored; without `--yes` it prints the exact pull requests it would close and makes no mutation.
+Listing and filtering are read-only; `close` is the only mutation and has no bulk or `--all` form.
+The default budget is 20 seconds and can be changed with `--budget`.
+The script header and `--help` are the authoritative interface reference.
+
 ## Running it periodically
 
 The `check` verb prints one line only when something new surfaced, so any scheduler or agent hook can run it.
@@ -50,8 +64,10 @@ The default budget is 20 seconds and can be changed with `--budget` when the cal
 Run `bin/github-notifications --state-dir "$HOME/.local/state/oss-mate" pending` to inspect the redacted durable details after a nonempty check result.
 After the details have been classified and reported to the operator, run the same command with `ack` to clear pending details while preserving the cursor and dedup set.
 The non-user-invocable skill at `skills/github-notification-triage/SKILL.md` owns the generic read-only classification and summary procedure.
+For non-mergeable pull requests the authenticated user opened, `bin/github-stale-prs --stale list` and `close` are the supported read and explicit-close path.
 
 ## Development
 
-Run the executable behavior suite with `tests/github-notifications.test.sh`.
+Run the executable behavior suite with `tests/github-notifications.test.sh` and `tests/github-stale-prs.test.sh`.
 Run `shellcheck bin/*` before proposing changes.
+Pull requests and pushes to `main` run the same shellcheck and behavior-test suite in GitHub Actions.
