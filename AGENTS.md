@@ -7,6 +7,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 There is one operator entry point, `bin/github-daily-review`, with one state file, one daily check line, and one pending view.
 Keep it that way; do not add a second tool, state file, or check line for a new kind of GitHub work.
 Its script header and `--help` are the authoritative interface reference, and `README.md` explains the three sets and the ack handshake.
+Agent skills live at `skills/<name>/SKILL.md` with the frontmatter shape of `skills/oss-contribute/SKILL.md`; after adding one, confirm `npx skills add <worktree path> --list` discovers it and add its README section.
 
 ## Standing rules for tools in this repository
 

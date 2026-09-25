@@ -117,6 +117,27 @@ List skills available in this repository without installing:
 npx skills add calebl/oss-mate --list
 ```
 
+## Should-I-build-it skill
+
+The `oss-should-i` skill at `skills/oss-should-i/SKILL.md` answers whether an idea is worth building or whether an open-source or commercial alternative already covers it.
+It pins the problem down to a few decision dimensions, searches GitHub, package registries, and the web for candidates, verifies each one against its current docs or repository rather than memory, and returns a "Where it sits" analysis: a blunt verdict, what already ships, a linked comparison table, the residual gap and how to test it, and a dated verification note.
+It ends with exactly one recommendation of build, contribute to a named project, or don't build, and it never drafts code or posts anything upstream.
+
+Install it with the logged-in `gh` CLI available:
+
+```bash
+npx skills add calebl/oss-mate --skill oss-should-i
+```
+
+The same `--list` command above shows it alongside the other skills in this repository.
+
+### Recommended model
+
+This is a recommendation rather than a requirement; the skill runs on any agent that can fetch pages and use `gh`.
+Default to Claude Opus 5.5 at high effort, because the skill is research-heavy and has to resist the pull toward telling you your idea is new.
+Use Claude Fable 5.1 for high-stakes decisions, such as before committing weeks to a build.
+Claude Sonnet 5 is fine for a quick "does this already exist?" check, but it is more likely to miss adjacent tools that solve the same job under a different name.
+
 ## Development
 
 Run the executable behavior suite with `tests/github-daily-review.test.sh`.
