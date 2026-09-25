@@ -117,8 +117,59 @@ List skills available in this repository without installing:
 npx skills add calebl/oss-mate --list
 ```
 
+## Open-source contribution status
+
+`bin/oss-status` prints a one-shot, read-only snapshot of the authenticated user's open-source
+footprint: open pull requests authored in repositories they do not own, pull requests merged in
+the last 30 days (`--days` changes the window), issues/pull requests commented on and pull
+requests reviewed in that same window, open pull requests currently awaiting the user's review,
+and every public, non-fork, non-archived repository they own with its star count and a health
+score. It uses the logged-in `gh` CLI exactly like `github-daily-review`, manages no token, holds
+no state file, and never prints the login. `bin/oss-status --help` is the authoritative interface
+reference.
+
+### Health score
+
+Every maintained repository starts at 100 points and loses points for six read-only signals,
+each capped and printed alongside the total so the breakdown is visible in the output:
+
+- open issues: -1 per open issue, capped at -20
+- open pull requests: -2 per open pull request, capped at -20
+- stale reviews: -5 per open, non-draft pull request unreviewed or still awaiting review and not
+  updated in 14+ days, capped at -20
+- stale default branch: -1 per 14 days since the last default-branch commit, capped at -20
+- stale releases: -1 per 90 days since the last published release, 0 if the repository has never
+  published one, capped at -10
+- failing CI: -10 if the default branch's latest commit status/check rollup is FAILURE or ERROR,
+  -5 if PENDING/EXPECTED, else 0
+
+The score floors at 0. It is a rough read-only proxy from cheap signals, not a judgment of the
+repository or its maintainers.
+
+### Redaction and scope
+
+A private repository, or one listed in the owned-elsewhere config (the same file and format
+`github-daily-review` uses, see above), appears only as a per-section count: never by name,
+number, owner, or title.
+
+`bin/oss-status` does not track new issues or pull requests on owned repositories; that signal
+already has an owner in `github-daily-review`, and this repository's shape keeps one check line
+per kind of GitHub work rather than two places to watch the same thing. It also does not report a
+raw comment count, because no read-only GitHub API reports one without walking every
+commented-on thread; it reports threads touched instead, which GitHub's search API can answer in
+one call.
+
+### The oss-status skill
+
+The `oss-status` skill lives at `.oss-mate/skills/oss-status/SKILL.md`, deliberately outside
+`skills/` and every directory the `skills` npm package treats as an agent skill location, so it
+never appears in `npx skills add calebl/oss-mate --list` and is never installed into another
+project. It only runs `bin/oss-status` and reports its output; load it from within this
+repository's worktree when asked for a profile, snapshot, or status of the operator's
+open-source contributions.
+
 ## Development
 
-Run the executable behavior suite with `tests/github-daily-review.test.sh`.
+Run the executable behavior suite with `tests/github-daily-review.test.sh` and `tests/oss-status.test.sh`.
 Run `shellcheck bin/*` before proposing changes.
 Pull requests and pushes to `main` run the same shellcheck and behavior-test suite in GitHub Actions.

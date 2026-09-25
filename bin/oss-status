@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# oss-status - a read-only snapshot of the authenticated user's open-source footprint.
+#
+# Usage:
+#   oss-status [options]
+#   oss-status --help
+#
+# Options:
+#   --config FILE   Read owned-elsewhere JSON, same shape and defaults as github-daily-review
+#                   (default: $OSS_MATE_OWNED_CONFIG, then $OSS_MATE_STATE_DIR (or
+#                   $XDG_STATE_HOME/oss-mate, falling back to ~/.local/state/oss-mate)
+#                   /oss-mate-owned.json, then .../github-notifications-owned.json).
+#   --days N        Window, in days, for "merged" and "comments/reviews" sections (default 30).
+#   --limit N       Cap the bounded list under each section (default 10).
+#   --budget SECONDS  Bound the run (default: $OSS_MATE_CHECK_BUDGET or 45; 1..120).
+#
+# This tool is stateless: it holds no boundary and no dedup keys, and every run reports the
+# current snapshot from scratch. It never posts, comments, labels, marks read, or otherwise
+# mutates GitHub; it makes GET and GraphQL read requests only.
+#
+# Sections:
+#   open-prs       Every open pull request the authenticated user authored in a public
+#                  repository they do not own.
+#   merged-prs     Pull requests authored by the user that merged in the last N days.
+#   comments       Issues and pull requests the user left a comment on in the last N days
+#                  (one row per thread, not per comment), and pull requests the user
+#                  reviewed in the last N days. GitHub's search API is the only read-only
+#                  source for this and reports per-thread activity, not a raw comment count.
+#   awaiting-review  Open pull requests where the user is a requested reviewer, right now.
+#   repos          Public, non-fork, non-archived repositories the user owns, each with its
+#                  star count and a health score; see "Health score" below.
+#
+# Health score:
+#   Every owned repository starts at 100 and loses points for six read-only signals, each
+#   printed alongside the total so the breakdown is visible:
+#     open issues        -1 per open issue,                          capped at -20
+#     open pull requests  -2 per open pull request,                  capped at -20
+#     stale reviews       -5 per open, non-draft pull request that is unreviewed or still
+#                          awaiting a review and has not been updated in 14+ days, capped at -20
+#     stale default branch -1 per 14 days since the last default-branch commit, capped at -20
+#     stale releases       -1 per 90 days since the last published release (0 if the
+#                          repository has never published one), capped at -10
+#     failing CI            -10 if the default branch's latest commit status/check rollup is
+#                          FAILURE or ERROR, -5 if it is PENDING/EXPECTED, else 0
+#   The score floors at 0. It is a rough read-only proxy, not a judgment of the repository.
+#
+# Redaction:
+#   A private repository, or one listed in the owned-elsewhere config (same file and format
+#   as github-daily-review's), appears only as a per-section count: never by name, number,
+#   owner, or title. See github-daily-review --help for the config file shape.
+#
+# Extras included, and why:
+#   awaiting-review is one cheap search call and flags a thread the user is specifically
+#   asked to look at, which a plain PR/comment inventory would not surface.
+#   merged-prs and the stale flag on open-prs are already in the data an open-PR pass reads,
+#   so they cost nothing extra to report.
+#
+# Extras left out, and why:
+#   New issues/PRs on owned repos already have an owner: github-daily-review, whose stated
+#   shape is one entry point with one check line; duplicating that here would create a second
+#   place to watch for the same signal.
+#   A raw "comments made" count is not offered because no read-only GitHub API reports it
+#   without walking every commented-on thread's comment list, which is far outside this
+#   tool's budget for a routine snapshot.
+set -eu
+export LC_ALL=C
+
+fail() { printf 'oss-status: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -eu$/s/^# \{0,1\}//p' "$0"; }
+
+STATE_DIR=${OSS_MATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oss-mate}
+CONFIG=${OSS_MATE_OWNED_CONFIG:-}
+BUDGET=${OSS_MATE_CHECK_BUDGET:-45}
+DAYS=30
+LIMIT=10
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config) [ "$#" -ge 2 ] || fail '--config needs a value'; CONFIG=$2; shift 2 ;;
+    --days) [ "$#" -ge 2 ] || fail '--days needs a value'; DAYS=$2; shift 2 ;;
+    --limit) [ "$#" -ge 2 ] || fail '--limit needs a value'; LIMIT=$2; shift 2 ;;
+    --budget) [ "$#" -ge 2 ] || fail '--budget needs a value'; BUDGET=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+case "$DAYS" in ''|*[!0-9]*) fail '--days must be a whole number from 1 to 365' ;; esac
+[ "$DAYS" -ge 1 ] && [ "$DAYS" -le 365 ] || fail '--days must be a whole number from 1 to 365'
+case "$LIMIT" in ''|*[!0-9]*) fail '--limit must be a whole number from 1 to 100' ;; esac
+[ "$LIMIT" -ge 1 ] && [ "$LIMIT" -le 100 ] || fail '--limit must be a whole number from 1 to 100'
+case "$BUDGET" in ''|*[!0-9]*) fail '--budget must be a whole number from 1 to 120' ;; esac
+[ "$BUDGET" -ge 1 ] && [ "$BUDGET" -le 120 ] || fail '--budget must be a whole number from 1 to 120'
+if [ -z "$CONFIG" ]; then
+  CONFIG="$STATE_DIR/oss-mate-owned.json"
+  [ -e "$CONFIG" ] || [ ! -e "$STATE_DIR/github-notifications-owned.json" ] \
+    || CONFIG="$STATE_DIR/github-notifications-owned.json"
+fi
+NOW=${OSS_MATE_NOW:-$(date +%s)}
+NODE_CHUNK=${OSS_MATE_NODE_CHUNK:-30}
+case "$NOW:$NODE_CHUNK" in *[!0-9:]*) fail 'time and chunk settings must be whole numbers' ;; esac
+[ "$NODE_CHUNK" -ge 1 ] && [ "$NODE_CHUNK" -le 50 ] || fail 'OSS_MATE_NODE_CHUNK must be from 1 to 50'
+command -v jq >/dev/null 2>&1 || fail 'jq is required'
+command -v gh >/dev/null 2>&1 || fail 'gh is required'
+
+JQ_COMMON='
+  def sane: tostring | gsub("[\u0000-\u001f\u007f]"; " ");
+  def bounded: sane | .[0:160];
+  def is_excluded($cfg; $repo; $owner):
+    any(($cfg.owners // [])[]; ascii_downcase == ($owner|ascii_downcase)) or
+    any(($cfg.repositories // [])[]; ascii_downcase == ($repo|ascii_downcase));
+'
+
+validate_config() {
+  [ -e "$CONFIG" ] || return 0
+  [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail 'owned-elsewhere config must be a regular file'
+  jq -e 'type=="object" and ((.owners // [])|type)=="array" and
+    ((.repositories // [])|type)=="array" and
+    all((.owners // [])[]; type=="string" and length>0) and
+    all((.repositories // [])[]; type=="string" and test("^[^/]+/[^/]+$"))' "$CONFIG" >/dev/null 2>&1 \
+    || fail 'owned-elsewhere config is invalid'
+}
+validate_config
+
+DEADLINE=$(( $(date +%s) + BUDGET ))
+budget_remain() {
+  local remain=$((DEADLINE - $(date +%s)))
+  [ "$remain" -gt 0 ] || return 1
+  printf '%s' "$remain"
+}
+gh_get() {
+  local remain
+  remain=$(budget_remain) || fail 'budget exhausted'
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api --method GET "$1" > "$2" \
+    || fail "GitHub read failed or exceeded its budget for $1"
+}
+gh_graphql() {
+  local remain
+  remain=$(budget_remain) || fail 'budget exhausted'
+  timeout "$remain" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh api graphql -f query="$1" > "$2" \
+    || fail 'GitHub GraphQL read failed or exceeded its budget'
+}
+
+NODE_PAGE=0
+fetch_node_chunk() {
+  local template=$1 out=$2
+  shift 2
+  local ids='' id response
+  for id in "$@"; do
+    if [ -z "$ids" ]; then ids="\"$id\""; else ids="$ids,\"$id\""; fi
+  done
+  NODE_PAGE=$((NODE_PAGE + 1))
+  response="$TMPDIR_RUN/nodes-$NODE_PAGE.json"
+  gh_graphql "${template//@IDS@/$ids}" "$response"
+  jq -e '.data.nodes | type == "array"' "$response" >/dev/null 2>&1 \
+    || fail 'GitHub returned an invalid GraphQL node page'
+  jq -c '.data.nodes[] | select(. != null)' "$response" >> "$out"
+}
+fetch_nodes() {
+  local template=$1 idfile=$2 out=$3
+  local -a chunk=()
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    case "$id" in *[!A-Za-z0-9_=+/:.-]*) fail 'GitHub returned an invalid node id' ;; esac
+    chunk+=("$id")
+    if [ "${#chunk[@]}" -ge "$NODE_CHUNK" ]; then
+      fetch_node_chunk "$template" "$out" "${chunk[@]}"
+      chunk=()
+    fi
+  done < "$idfile"
+  [ "${#chunk[@]}" -eq 0 ] || fetch_node_chunk "$template" "$out" "${chunk[@]}"
+}
+
+search_collect() {
+  local query=$1 outfile=$2
+  gh_get "/search/issues?q=$(printf '%s' "$query" | jq -sRr @uri)&per_page=100" \
+    "$TMPDIR_RUN/search-$outfile.json"
+  jq -e '.items | type == "array"' "$TMPDIR_RUN/search-$outfile.json" >/dev/null 2>&1 \
+    || fail "GitHub returned an invalid search page for $outfile"
+  jq -c '
+    def repo_name: sub("^https://api.github.com/repos/"; "");
+    [ .items[] | select((.number|type)=="number" and (.node_id|type)=="string") |
+      ((.repository_url // "") | repo_name) as $repo |
+      {repo:$repo, owner:(($repo | split("/"))[0] // ""), number:.number, node_id:.node_id} ]
+  ' "$TMPDIR_RUN/search-$outfile.json" > "$TMPDIR_RUN/$outfile-items.json"
+}
+
+PR_QUERY='query { nodes(ids: [@IDS@]) { __typename
+  ... on PullRequest { id number title createdAt updatedAt mergedAt mergeable reviewDecision isDraft
+    author { login } repository { nameWithOwner isPrivate owner { login } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }
+} }'
+THREAD_QUERY='query { nodes(ids: [@IDS@]) { __typename
+  ... on Issue { id title updatedAt repository { nameWithOwner isPrivate owner { login } } number }
+  ... on PullRequest { id title updatedAt repository { nameWithOwner isPrivate owner { login } } number }
+} }'
+REPO_QUERY='query { nodes(ids: [@IDS@]) { __typename
+  ... on Repository { id nameWithOwner isPrivate stargazerCount
+    openIssues: issues(states: OPEN) { totalCount }
+    openPRs: pullRequests(states: OPEN) { totalCount }
+    reviewPRs: pullRequests(states: OPEN, first: 100) { nodes { isDraft reviewDecision updatedAt } }
+    defaultBranchRef { target { ... on Commit { committedDate statusCheckRollup { state } } } }
+    releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { publishedAt } }
+  }
+} }'
+
+TMPDIR_RUN=$(mktemp -d "${TMPDIR:-/tmp}/oss-status.XXXXXX")
+trap 'rm -rf -- "$TMPDIR_RUN"' EXIT HUP INT TERM
+
+if [ -e "$CONFIG" ]; then
+  cp "$CONFIG" "$TMPDIR_RUN/config.json"
+else
+  printf '{"owners":[],"repositories":[]}\n' > "$TMPDIR_RUN/config.json"
+fi
+gh_get user "$TMPDIR_RUN/user.json"
+LOGIN=$(jq -er '.login | select(type=="string" and length>0)' "$TMPDIR_RUN/user.json") \
+  || fail 'authenticated-user lookup returned an invalid login'
+
+SINCE_DATE=$(date -u -d "@$((NOW - DAYS * 86400))" +%Y-%m-%d)
+SINCE_STAMP=$(date -u -d "@$((NOW - DAYS * 86400))" +%Y-%m-%dT%H:%M:%SZ)
+
+# --- open pull requests the user authored in repos they do not own -----------------------
+search_collect "is:pr is:open author:${LOGIN} -user:${LOGIN}" open_prs
+jq -r '.[].node_id' "$TMPDIR_RUN/open_prs-items.json" > "$TMPDIR_RUN/open-pr-ids"
+: > "$TMPDIR_RUN/open-pr-nodes.jsonl"
+fetch_nodes "$PR_QUERY" "$TMPDIR_RUN/open-pr-ids" "$TMPDIR_RUN/open-pr-nodes.jsonl"
+jq -sc '.' "$TMPDIR_RUN/open-pr-nodes.jsonl" > "$TMPDIR_RUN/open-pr-nodes.json"
+
+# --- pull requests the user authored that merged in the window ---------------------------
+search_collect "is:pr is:merged author:${LOGIN} merged:>=${SINCE_DATE}" merged_prs
+jq -r '.[].node_id' "$TMPDIR_RUN/merged_prs-items.json" > "$TMPDIR_RUN/merged-pr-ids"
+: > "$TMPDIR_RUN/merged-pr-nodes.jsonl"
+fetch_nodes "$PR_QUERY" "$TMPDIR_RUN/merged-pr-ids" "$TMPDIR_RUN/merged-pr-nodes.jsonl"
+jq -sc '.' "$TMPDIR_RUN/merged-pr-nodes.jsonl" > "$TMPDIR_RUN/merged-pr-nodes.json"
+
+# --- threads the user commented on, and pull requests the user reviewed, in the window ----
+search_collect "commenter:${LOGIN} updated:>=${SINCE_DATE}" commented
+jq -r '.[].node_id' "$TMPDIR_RUN/commented-items.json" > "$TMPDIR_RUN/commented-ids"
+: > "$TMPDIR_RUN/commented-nodes.jsonl"
+fetch_nodes "$THREAD_QUERY" "$TMPDIR_RUN/commented-ids" "$TMPDIR_RUN/commented-nodes.jsonl"
+jq -sc --arg since "$SINCE_STAMP" '[ .[] | select(.updatedAt >= $since) ]' \
+  "$TMPDIR_RUN/commented-nodes.jsonl" > "$TMPDIR_RUN/commented-nodes.json"
+
+search_collect "is:pr reviewed-by:${LOGIN} updated:>=${SINCE_DATE}" reviewed
+jq -r '.[].node_id' "$TMPDIR_RUN/reviewed-items.json" > "$TMPDIR_RUN/reviewed-ids"
+: > "$TMPDIR_RUN/reviewed-nodes.jsonl"
+fetch_nodes "$THREAD_QUERY" "$TMPDIR_RUN/reviewed-ids" "$TMPDIR_RUN/reviewed-nodes.jsonl"
+jq -sc --arg since "$SINCE_STAMP" '[ .[] | select(.updatedAt >= $since) ]' \
+  "$TMPDIR_RUN/reviewed-nodes.jsonl" > "$TMPDIR_RUN/reviewed-nodes.json"
+
+# --- open pull requests awaiting the user's review, right now -----------------------------
+search_collect "is:pr is:open review-requested:${LOGIN}" awaiting
+jq -r '.[].node_id' "$TMPDIR_RUN/awaiting-items.json" > "$TMPDIR_RUN/awaiting-ids"
+: > "$TMPDIR_RUN/awaiting-nodes.jsonl"
+fetch_nodes "$THREAD_QUERY" "$TMPDIR_RUN/awaiting-ids" "$TMPDIR_RUN/awaiting-nodes.jsonl"
+jq -sc '.' "$TMPDIR_RUN/awaiting-nodes.jsonl" > "$TMPDIR_RUN/awaiting-nodes.json"
+
+# --- public, non-fork, non-archived repositories the user owns ----------------------------
+gh_get "users/${LOGIN}/repos?type=owner&per_page=100" "$TMPDIR_RUN/owned-repos.json"
+jq -e 'type == "array"' "$TMPDIR_RUN/owned-repos.json" >/dev/null 2>&1 \
+  || fail 'GitHub returned an invalid repository list'
+jq -c '[ .[] | select(.fork == false and .private == false and .archived == false) |
+  {node_id, full_name, name, stargazers_count} ]' \
+  "$TMPDIR_RUN/owned-repos.json" > "$TMPDIR_RUN/owned-repos-filtered.json"
+jq -r '.[].node_id' "$TMPDIR_RUN/owned-repos-filtered.json" > "$TMPDIR_RUN/owned-repo-ids"
+: > "$TMPDIR_RUN/owned-repo-nodes.jsonl"
+fetch_nodes "$REPO_QUERY" "$TMPDIR_RUN/owned-repo-ids" "$TMPDIR_RUN/owned-repo-nodes.jsonl"
+jq -sc '.' "$TMPDIR_RUN/owned-repo-nodes.jsonl" > "$TMPDIR_RUN/owned-repo-nodes.json"
+
+# --- assemble and print the redacted report -------------------------------------------------
+jq -n "$JQ_COMMON"'
+  def cap($n; $x): [([$x, 0] | max), $n] | min;
+  def hidden($cfg): .repository.isPrivate or is_excluded($cfg; .repository.nameWithOwner; .repository.owner.login);
+  def hidden_repo($cfg): .isPrivate or is_excluded($cfg; .nameWithOwner; (.nameWithOwner | split("/")[0]));
+  def pr_row: {
+    repo: (.repository.nameWithOwner | sane), number,
+    title: (.title | bounded),
+    updated_at: .updatedAt,
+    stale: (.mergeable == "CONFLICTING"),
+    review_decision: (.reviewDecision // "PENDING")
+  };
+  def merged_row: {
+    repo: (.repository.nameWithOwner | sane), number,
+    title: (.title | bounded), merged_at: .mergedAt
+  };
+  def thread_row: {
+    repo: (.repository.nameWithOwner | sane), number,
+    title: (.title | bounded), updated_at: .updatedAt
+  };
+
+  $cfg[0] as $cfg |
+  ($open_prs[0] | map(select(hidden($cfg)|not) | pr_row)) as $open_pr_rows |
+  ($open_prs[0] | map(select(hidden($cfg))) | length) as $open_pr_hidden |
+  ($merged_prs[0] | map(select(hidden($cfg)|not) | merged_row)) as $merged_rows |
+  ($merged_prs[0] | map(select(hidden($cfg))) | length) as $merged_hidden |
+  ($commented[0] | map(select(hidden($cfg)|not) | thread_row)) as $comment_rows |
+  ($commented[0] | map(select(hidden($cfg))) | length) as $comment_hidden |
+  ($reviewed[0] | map(select(hidden($cfg)|not) | thread_row)) as $review_rows |
+  ($reviewed[0] | map(select(hidden($cfg))) | length) as $review_hidden |
+  ($awaiting[0] | map(select(hidden($cfg)|not) | thread_row)) as $awaiting_rows |
+  ($awaiting[0] | map(select(hidden($cfg))) | length) as $awaiting_hidden |
+  ($repos[0] | map(select(hidden_repo($cfg)|not) | . as $r |
+    (($r.reviewPRs.nodes // []) |
+      map(select(.isDraft == false and (.reviewDecision == null or .reviewDecision == "REVIEW_REQUIRED")
+                 and .updatedAt < $stale_cutoff)) | length) as $stale_reviews |
+    (($r.defaultBranchRef.target.committedDate // null)) as $last_commit |
+    ($last_commit | if . == null then null else (($now - (. | fromdateiso8601)) / 86400 | floor) end)
+      as $days_since_commit |
+    (($r.releases.nodes[0].publishedAt // null)) as $last_release |
+    ($last_release | if . == null then null else (($now - (. | fromdateiso8601)) / 86400 | floor) end)
+      as $days_since_release |
+    (($r.defaultBranchRef.target.statusCheckRollup.state // null)) as $ci_state |
+    (cap(20; $r.openIssues.totalCount)) as $p_issues |
+    (cap(20; $r.openPRs.totalCount * 2)) as $p_prs |
+    (cap(20; $stale_reviews * 5)) as $p_stale |
+    (cap(20; (if $days_since_commit == null then 0 else ($days_since_commit / 14 | floor) end))) as $p_commit |
+    (cap(10; (if $days_since_release == null then 0 else ($days_since_release / 90 | floor) end))) as $p_release |
+    ((if $ci_state == "FAILURE" or $ci_state == "ERROR" then 10
+      elif $ci_state == "PENDING" or $ci_state == "EXPECTED" then 5 else 0 end)) as $p_ci |
+    ([100 - ($p_issues + $p_prs + $p_stale + $p_commit + $p_release + $p_ci), 0] | max) as $score |
+    { repo: ($r.nameWithOwner | sane), stars: $r.stargazerCount, score: $score,
+      breakdown: { open_issues: {count: $r.openIssues.totalCount, penalty: $p_issues},
+                   open_prs: {count: $r.openPRs.totalCount, penalty: $p_prs},
+                   stale_reviews: {count: $stale_reviews, penalty: $p_stale},
+                   days_since_commit: {value: $days_since_commit, penalty: $p_commit},
+                   days_since_release: {value: $days_since_release, penalty: $p_release},
+                   ci: {state: $ci_state, penalty: $p_ci} } }
+  )) as $repo_rows |
+  ($repos[0] | map(select(hidden_repo($cfg))) | length) as $repo_hidden |
+  {
+    login: $login,
+    generated_at: $generated,
+    window_days: $days,
+    open_prs: $open_pr_rows, open_prs_hidden: $open_pr_hidden,
+    merged_prs: $merged_rows, merged_prs_hidden: $merged_hidden,
+    comments: $comment_rows, comments_hidden: $comment_hidden,
+    reviews: $review_rows, reviews_hidden: $review_hidden,
+    awaiting_review: $awaiting_rows, awaiting_review_hidden: $awaiting_hidden,
+    repos: ($repo_rows | sort_by(-.stars)), repos_hidden: $repo_hidden
+  }
+' --slurpfile cfg "$TMPDIR_RUN/config.json" \
+  --slurpfile open_prs "$TMPDIR_RUN/open-pr-nodes.json" \
+  --slurpfile merged_prs "$TMPDIR_RUN/merged-pr-nodes.json" \
+  --slurpfile commented "$TMPDIR_RUN/commented-nodes.json" \
+  --slurpfile reviewed "$TMPDIR_RUN/reviewed-nodes.json" \
+  --slurpfile awaiting "$TMPDIR_RUN/awaiting-nodes.json" \
+  --slurpfile repos "$TMPDIR_RUN/owned-repo-nodes.json" \
+  --arg login "$LOGIN" --arg generated "$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson days "$DAYS" --argjson now "$NOW" \
+  --arg stale_cutoff "$(date -u -d "@$((NOW - 14 * 86400))" +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$TMPDIR_RUN/report.json"
+
+jq -r --argjson limit "$LIMIT" '
+  "oss-status for \(.login) at \(.generated_at) (window: \(.window_days)d)",
+  "",
+  "open pull requests you authored elsewhere: \(.open_prs|length)" + (if .open_prs_hidden > 0 then " (+\(.open_prs_hidden) hidden)" else "" end),
+  ( .open_prs[:$limit][] |
+    "  open-pr \(.repo)#\(.number) review=\(.review_decision)\(if .stale then " stale" else "" end) updated=\(.updated_at) \(.title|@json)" ),
+  "",
+  "pull requests merged in the last \(.window_days) days: \(.merged_prs|length)" + (if .merged_prs_hidden > 0 then " (+\(.merged_prs_hidden) hidden)" else "" end),
+  ( .merged_prs[:$limit][] |
+    "  merged-pr \(.repo)#\(.number) merged=\(.merged_at) \(.title|@json)" ),
+  "",
+  "threads commented on in the last \(.window_days) days: \(.comments|length)" + (if .comments_hidden > 0 then " (+\(.comments_hidden) hidden)" else "" end),
+  ( .comments[:$limit][] |
+    "  comment \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
+  "",
+  "pull requests reviewed in the last \(.window_days) days: \(.reviews|length)" + (if .reviews_hidden > 0 then " (+\(.reviews_hidden) hidden)" else "" end),
+  ( .reviews[:$limit][] |
+    "  review \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
+  "",
+  "pull requests awaiting your review: \(.awaiting_review|length)" + (if .awaiting_review_hidden > 0 then " (+\(.awaiting_review_hidden) hidden)" else "" end),
+  ( .awaiting_review[:$limit][] |
+    "  awaiting-review \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
+  "",
+  "public repositories maintained: \(.repos|length)" + (if .repos_hidden > 0 then " (+\(.repos_hidden) hidden)" else "" end),
+  ( .repos[] | . as $r | .breakdown as $b |
+    "  repo \($r.repo) stars=\($r.stars) health=\($r.score)/100" +
+    " (open_issues=\($b.open_issues.count)/-\($b.open_issues.penalty)" +
+    " open_prs=\($b.open_prs.count)/-\($b.open_prs.penalty)" +
+    " stale_reviews=\($b.stale_reviews.count)/-\($b.stale_reviews.penalty)" +
+    " days_since_commit=\($b.days_since_commit.value // "n/a")/-\($b.days_since_commit.penalty)" +
+    " days_since_release=\($b.days_since_release.value // "n/a")/-\($b.days_since_release.penalty)" +
+    " ci=\($b.ci.state // "unknown")/-\($b.ci.penalty))" )
+' "$TMPDIR_RUN/report.json"

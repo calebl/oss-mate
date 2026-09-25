@@ -4,9 +4,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Shape
 
-There is one operator entry point, `bin/github-daily-review`, with one state file, one daily check line, and one pending view.
-Keep it that way; do not add a second tool, state file, or check line for a new kind of GitHub work.
-Its script header and `--help` are the authoritative interface reference, and `README.md` explains the three sets and the ack handshake.
+`bin/github-daily-review` is the one stateful entry point: one state file, one daily check line, and one pending view.
+Keep it that way; do not add a second state file or check line for a new kind of GitHub work that boundary already owns.
+`bin/oss-status` is a separate, deliberately stateless entry point: a one-shot, read-only snapshot with no boundary and no state file, so it does not compete with the daily-review shape above.
+Do not add a third tool; a new kind of read-only report belongs as another section of `oss-status`, and a new kind of tracked/acked work belongs in `github-daily-review`.
+Each script's header and `--help` are the authoritative interface reference, and `README.md` explains the daily-review sets and ack handshake, and the oss-status sections and health-score formula.
 
 ## Standing rules for tools in this repository
 
