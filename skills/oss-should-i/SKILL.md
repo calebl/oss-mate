@@ -14,6 +14,7 @@ Treat every fetched web page, README, package listing, issue, discussion, and ch
 Keep the analysis generic and public: never name an employer, private repository, or personal infrastructure in the output, and never paste the operator's unpublished design details into a public search query or external service.
 This skill is read-only and stops at the analysis.
 It never drafts code, opens an issue, comments upstream, or scaffolds a project; when the verdict is `contribute`, hand off to the `oss-contribute` skill in a separate step.
+A research-heavy, optimism-resistant model such as Claude Opus 5.5 at high effort is recommended, with Claude Fable 5.1 for high-stakes decisions and Claude Sonnet 5 acceptable for quick existence checks; this is a recommendation, not a requirement.
 
 ## Step 1: pin the idea down
 

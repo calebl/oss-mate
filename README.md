@@ -131,6 +131,13 @@ npx skills add calebl/oss-mate --skill oss-should-i
 
 The same `--list` command above shows it alongside the other skills in this repository.
 
+### Recommended model
+
+This is a recommendation rather than a requirement; the skill runs on any agent that can fetch pages and use `gh`.
+Default to Claude Opus 5.5 at high effort, because the skill is research-heavy and has to resist the pull toward telling you your idea is new.
+Use Claude Fable 5.1 for high-stakes decisions, such as before committing weeks to a build.
+Claude Sonnet 5 is fine for a quick "does this already exist?" check, but it is more likely to miss adjacent tools that solve the same job under a different name.
+
 ## Development
 
 Run the executable behavior suite with `tests/github-daily-review.test.sh`.
