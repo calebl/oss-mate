@@ -99,6 +99,24 @@ After a nonempty check line, run the same command with `pending`, report the rev
 The non-user-invocable skill at `skills/github-daily-review/SKILL.md` owns the generic read-only classification and summary procedure.
 `mark-read --yes` and `close --yes` remain separate explicit steps the operator decides on after the summary.
 
+## Open-source contribution skill
+
+The `oss-contribute` skill at `skills/oss-contribute/SKILL.md` guides upstream contributions to open-source repositories the operator does not own: duplicate checks against open issues and pull requests, explicit approval before any comment or pull request, and routing every submission through no-mistakes.
+It does not apply to repositories the operator owns or administers.
+
+Install it with the logged-in `gh` CLI available and the [vercel-labs `skills` package](https://www.npmjs.com/package/skills):
+
+```bash
+npx skills add calebl/oss-mate --skill oss-contribute
+```
+
+Add `-g` to install globally, or `-y` to skip confirmation prompts.
+List skills available in this repository without installing:
+
+```bash
+npx skills add calebl/oss-mate --list
+```
+
 ## Development
 
 Run the executable behavior suite with `tests/github-daily-review.test.sh`.
