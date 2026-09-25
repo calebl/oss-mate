@@ -178,7 +178,7 @@ printf '%s' "$OUT" | grep -q 'review other/repo#8' || fail 'review missing'
 printf '%s' "$OUT" | grep -q 'awaiting-review other/repo#9' || fail 'awaiting-review missing'
 ok "open PRs, merged PRs, comments, reviews, and awaiting-review each surface with a bounded row"
 
-# --- private repositories and config-excluded repositories are counts only ----------------
+# --- private repositories and config-excluded repositories are dropped entirely -----------
 reset_case
 search_item 5 other/repo PR1 | search_page 1 > "$TMP/responses/search-open.json"
 pr_node PR1 5 other/repo "Fix bug" 2026-08-01T00:00:00Z MERGEABLE true > "$TMP/responses/node-PR1.json"
@@ -187,23 +187,25 @@ repo_list_entry REPO2 me/priv 2 false true > "$TMP/tmp-priv.json"
 jq -s '.' "$TMP/tmp-pub.json" "$TMP/tmp-priv.json" > "$TMP/responses/repos.json"
 repo_node REPO1 me/pub 10 false 1 0 > "$TMP/responses/node-REPO1.json"
 OUT=$(run)
-printf '%s' "$OUT" | grep -q 'open pull requests you authored elsewhere: 0 (+1 hidden)' \
-  || fail 'private open pr should be hidden as a count'
-printf '%s' "$OUT" | grep -qv 'other/repo#5' || true
+printf '%s' "$OUT" | grep -q 'open pull requests you authored elsewhere: 0' \
+  || fail 'private open pr should be dropped entirely, with no count'
+if printf '%s' "$OUT" | grep -q 'hidden'; then fail 'no output line should ever mention "hidden"'; fi
+printf '%s' "$OUT" | grep -qv 'other/repo#5' || fail 'private pull request leaked'
 printf '%s' "$OUT" | grep -q 'me/pub' || fail 'public repo should be visible'
 printf '%s' "$OUT" | grep -qv 'me/priv' || fail 'private repo REST entry (never fetched) leaked its name'
-ok "a private pull request and a private repository are counts only, never named"
+ok "a private pull request and a private repository are dropped entirely, with no hidden count"
 
-# --- the owned-elsewhere config redacts by owner and by repository -----------------------
+# --- the owned-elsewhere config drops by owner and by repository, with no count -----------
 reset_case
 search_item 5 excluded-owner/repo PR1 | search_page 1 > "$TMP/responses/search-open.json"
 pr_node PR1 5 excluded-owner/repo "Fix bug" 2026-08-01T00:00:00Z > "$TMP/responses/node-PR1.json"
 printf '{"owners":["excluded-owner"],"repositories":[]}\n' > "$TMP/owned.json"
-OUT=$("$SCRIPT" --config "$TMP/owned.json") || fail 'config redaction run failed'
-printf '%s' "$OUT" | grep -q 'open pull requests you authored elsewhere: 0 (+1 hidden)' \
-  || fail 'owned-elsewhere owner should redact the pull request'
+OUT=$("$SCRIPT" --config "$TMP/owned.json") || fail 'config exclusion run failed'
+printf '%s' "$OUT" | grep -q 'open pull requests you authored elsewhere: 0' \
+  || fail 'owned-elsewhere owner should drop the pull request entirely'
+if printf '%s' "$OUT" | grep -q 'hidden'; then fail 'no output line should ever mention "hidden"'; fi
 printf '%s' "$OUT" | grep -qv 'excluded-owner' || fail 'excluded owner name leaked'
-ok "the owned-elsewhere config redacts a whole owner by count, with no name in the output"
+ok "the owned-elsewhere config drops a whole owner entirely, with no count and no name"
 
 # --- health score reports a per-signal breakdown that adds up to the total ----------------
 reset_case

@@ -146,11 +146,12 @@ each capped and printed alongside the total so the breakdown is visible in the o
 The score floors at 0. It is a rough read-only proxy from cheap signals, not a judgment of the
 repository or its maintainers.
 
-### Redaction and scope
+### Scope
 
-A private repository, or one listed in the owned-elsewhere config (the same file and format
-`github-daily-review` uses, see above), appears only as a per-section count: never by name,
-number, owner, or title.
+oss-mate is for open-source work only. A private repository, or one listed in the
+owned-elsewhere config (the same file and format `github-daily-review` uses, see above), is
+dropped from every section entirely: never by name, number, owner, or title, and never as a
+count either.
 
 `bin/oss-status` does not track new issues or pull requests on owned repositories; that signal
 already has an owner in `github-daily-review`, and this repository's shape keeps one check line

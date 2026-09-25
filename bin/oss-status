@@ -44,10 +44,11 @@
 #                          FAILURE or ERROR, -5 if it is PENDING/EXPECTED, else 0
 #   The score floors at 0. It is a rough read-only proxy, not a judgment of the repository.
 #
-# Redaction:
-#   A private repository, or one listed in the owned-elsewhere config (same file and format
-#   as github-daily-review's), appears only as a per-section count: never by name, number,
-#   owner, or title. See github-daily-review --help for the config file shape.
+# Scope:
+#   oss-mate is for open-source work only. A private repository, or one listed in the
+#   owned-elsewhere config (same file and format as github-daily-review's), is dropped
+#   entirely from every section and every count: no name, number, owner, title, or tally
+#   anywhere in the output. See github-daily-review --help for the config file shape.
 #
 # Extras included, and why:
 #   awaiting-review is one cheap search call and flags a thread the user is specifically
@@ -289,15 +290,10 @@ jq -n "$JQ_COMMON"'
 
   $cfg[0] as $cfg |
   ($open_prs[0] | map(select(hidden($cfg)|not) | pr_row)) as $open_pr_rows |
-  ($open_prs[0] | map(select(hidden($cfg))) | length) as $open_pr_hidden |
   ($merged_prs[0] | map(select(hidden($cfg)|not) | merged_row)) as $merged_rows |
-  ($merged_prs[0] | map(select(hidden($cfg))) | length) as $merged_hidden |
   ($commented[0] | map(select(hidden($cfg)|not) | thread_row)) as $comment_rows |
-  ($commented[0] | map(select(hidden($cfg))) | length) as $comment_hidden |
   ($reviewed[0] | map(select(hidden($cfg)|not) | thread_row)) as $review_rows |
-  ($reviewed[0] | map(select(hidden($cfg))) | length) as $review_hidden |
   ($awaiting[0] | map(select(hidden($cfg)|not) | thread_row)) as $awaiting_rows |
-  ($awaiting[0] | map(select(hidden($cfg))) | length) as $awaiting_hidden |
   ($repos[0] | map(select(hidden_repo($cfg)|not) | . as $r |
     (($r.reviewPRs.nodes // []) |
       map(select(.isDraft == false and (.reviewDecision == null or .reviewDecision == "REVIEW_REQUIRED")
@@ -325,17 +321,16 @@ jq -n "$JQ_COMMON"'
                    days_since_release: {value: $days_since_release, penalty: $p_release},
                    ci: {state: $ci_state, penalty: $p_ci} } }
   )) as $repo_rows |
-  ($repos[0] | map(select(hidden_repo($cfg))) | length) as $repo_hidden |
   {
     login: $login,
     generated_at: $generated,
     window_days: $days,
-    open_prs: $open_pr_rows, open_prs_hidden: $open_pr_hidden,
-    merged_prs: $merged_rows, merged_prs_hidden: $merged_hidden,
-    comments: $comment_rows, comments_hidden: $comment_hidden,
-    reviews: $review_rows, reviews_hidden: $review_hidden,
-    awaiting_review: $awaiting_rows, awaiting_review_hidden: $awaiting_hidden,
-    repos: ($repo_rows | sort_by(-.stars)), repos_hidden: $repo_hidden
+    open_prs: $open_pr_rows,
+    merged_prs: $merged_rows,
+    comments: $comment_rows,
+    reviews: $review_rows,
+    awaiting_review: $awaiting_rows,
+    repos: ($repo_rows | sort_by(-.stars))
   }
 ' --slurpfile cfg "$TMPDIR_RUN/config.json" \
   --slurpfile open_prs "$TMPDIR_RUN/open-pr-nodes.json" \
@@ -352,27 +347,27 @@ jq -n "$JQ_COMMON"'
 jq -r --argjson limit "$LIMIT" '
   "oss-status for \(.login) at \(.generated_at) (window: \(.window_days)d)",
   "",
-  "open pull requests you authored elsewhere: \(.open_prs|length)" + (if .open_prs_hidden > 0 then " (+\(.open_prs_hidden) hidden)" else "" end),
+  "open pull requests you authored elsewhere: \(.open_prs|length)",
   ( .open_prs[:$limit][] |
     "  open-pr \(.repo)#\(.number) review=\(.review_decision)\(if .stale then " stale" else "" end) updated=\(.updated_at) \(.title|@json)" ),
   "",
-  "pull requests merged in the last \(.window_days) days: \(.merged_prs|length)" + (if .merged_prs_hidden > 0 then " (+\(.merged_prs_hidden) hidden)" else "" end),
+  "pull requests merged in the last \(.window_days) days: \(.merged_prs|length)",
   ( .merged_prs[:$limit][] |
     "  merged-pr \(.repo)#\(.number) merged=\(.merged_at) \(.title|@json)" ),
   "",
-  "threads commented on in the last \(.window_days) days: \(.comments|length)" + (if .comments_hidden > 0 then " (+\(.comments_hidden) hidden)" else "" end),
+  "threads commented on in the last \(.window_days) days: \(.comments|length)",
   ( .comments[:$limit][] |
     "  comment \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
   "",
-  "pull requests reviewed in the last \(.window_days) days: \(.reviews|length)" + (if .reviews_hidden > 0 then " (+\(.reviews_hidden) hidden)" else "" end),
+  "pull requests reviewed in the last \(.window_days) days: \(.reviews|length)",
   ( .reviews[:$limit][] |
     "  review \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
   "",
-  "pull requests awaiting your review: \(.awaiting_review|length)" + (if .awaiting_review_hidden > 0 then " (+\(.awaiting_review_hidden) hidden)" else "" end),
+  "pull requests awaiting your review: \(.awaiting_review|length)",
   ( .awaiting_review[:$limit][] |
     "  awaiting-review \(.repo)#\(.number) updated=\(.updated_at) \(.title|@json)" ),
   "",
-  "public repositories maintained: \(.repos|length)" + (if .repos_hidden > 0 then " (+\(.repos_hidden) hidden)" else "" end),
+  "public repositories maintained: \(.repos|length)",
   ( .repos[] | . as $r | .breakdown as $b |
     "  repo \($r.repo) stars=\($r.stars) health=\($r.score)/100" +
     " (open_issues=\($b.open_issues.count)/-\($b.open_issues.penalty)" +
